@@ -28,15 +28,17 @@ void print_usage() {
                  "\n"
                  "usage:\n"
                  "  datum info     -i <carrier>\n"
-                 "  datum capacity -i <carrier> [--mode binary|raw|lsb] [--bits 1..4]\n"
+                 "  datum capacity -i <carrier> [--mode binary|raw|lsb] [--bits N]\n"
                  "  datum embed    -i <cover> -o <stego> -d <payload>"
-                 " [--mode binary|raw|lsb] [--bits 1..4]\n"
+                 " [--mode binary|raw|lsb] [--bits N]\n"
                  "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb]\n"
                  "  datum analyze  -i <carrier>\n"
                  "\n"
                  "notes:\n"
                  "  a carrier is an image or a video; the extension picks which\n"
-                 "  --bits sets the low bits per channel used by lsb (default 1)\n"
+                 "  --bits sets the payload bits per colour channel: lsb uses the\n"
+                 "  low 1..4 (default 1), raw the top 1..8 (default 8) and centres\n"
+                 "  what is left, which leaves raw a +/-2^(7-N) drift margin\n"
                  "  output must be .png for images and .mkv for video — lossy\n"
                  "  formats would erase the payload\n"
                  "  extract auto-detects the mode and bit depth unless --mode is given\n"
@@ -105,19 +107,27 @@ datum::Mode require_mode(const Flags& flags, datum::Mode fallback) {
     return *mode;
 }
 
-/// The per-mode parameter carried in the header. Only lsb uses it (k, the number
-/// of low bits per channel); other modes reject --bits so a typo is not ignored.
+/// The per-mode parameter carried in the header: payload bits per colour channel,
+/// which both lsb and raw use — lsb's k is how many *low* bits carry payload, raw's
+/// is how many *top* bits do. Modes without a parameter reject --bits, so a typo is
+/// not silently ignored.
+///
+/// Each default is that mode's original behaviour: lsb 1 (the quietest), raw 8 (one
+/// payload byte per channel).
 uint8_t require_param(const Flags& flags, datum::Mode mode) {
     const std::string* bits = find_flag(flags, "bits");
-    if (mode != datum::Mode::Lsb) {
+    const bool lsb = mode == datum::Mode::Lsb;
+    if (!lsb && mode != datum::Mode::Raw) {
         if (bits != nullptr) {
-            throw std::runtime_error("--bits only applies to --mode lsb");
+            throw std::runtime_error("--bits only applies to --mode lsb or --mode raw");
         }
         return 0;
     }
-    const int k = bits == nullptr ? 1 : std::stoi(*bits);
-    if (k < 1 || k > 4) {
-        throw std::runtime_error("--bits must be between 1 and 4");
+    const int most = lsb ? 4 : 8;
+    const int k = bits == nullptr ? (lsb ? 1 : 8) : std::stoi(*bits);
+    if (k < 1 || k > most) {
+        throw std::runtime_error("--bits must be between 1 and " + std::to_string(most) + " for " +
+                                 std::string(datum::mode_name(mode)) + " mode");
     }
     return static_cast<uint8_t>(k);
 }

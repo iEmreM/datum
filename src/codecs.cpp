@@ -16,6 +16,32 @@ std::size_t sample_index(const Image& image, std::size_t pixel, int channel) {
     return pixel * static_cast<std::size_t>(image.channels) + static_cast<std::size_t>(channel);
 }
 
+/// Pulls up to `k` bits into the low end of a byte, MSB-first.
+///
+/// A final partial group — the source ran out mid-group, which happens whenever
+/// 8·bytes is not a multiple of k — is left-aligned, so extraction reads its real
+/// bits before the padding rather than after it.
+uint8_t take_bits(BitReader& source, int k) {
+    int taken = 0;
+    uint8_t value = 0;
+    for (; taken < k && !source.exhausted(); ++taken) {
+        value = static_cast<uint8_t>(value << 1 | (source.read() ? 1u : 0u));
+    }
+    return static_cast<uint8_t>(value << (k - taken));
+}
+
+/// Pushes the low `k` bits of `value`, MSB-first. Returns false once `sink` holds
+/// `bits` bits in total, which is the caller's signal to stop scanning the image.
+bool put_bits(BitWriter& sink, uint8_t value, int k, std::size_t bits) {
+    for (int bit = k - 1; bit >= 0; --bit) {
+        if (sink.size() >= bits) {
+            return false;
+        }
+        sink.write(((value >> bit) & 1u) != 0);
+    }
+    return true;
+}
+
 /// Moves `sample` to the nearest value whose low k bits are `low`, instead of
 /// overwriting them: LSB *matching* rather than LSB replacement.
 ///
@@ -101,14 +127,7 @@ class LsbCodec final : public Codec {
                 if (source.exhausted()) {
                     return;
                 }
-                int taken = 0;
-                uint8_t low = 0;
-                for (; taken < k_ && !source.exhausted(); ++taken) {
-                    low = static_cast<uint8_t>(low << 1 | (source.read() ? 1u : 0u));
-                }
-                // A final partial group (only with k = 3, when 8·bytes ∤ k) is
-                // left-aligned so extraction reads its real bits before the padding.
-                low = static_cast<uint8_t>(low << (k_ - taken));
+                const uint8_t low = take_bits(source, k_);
                 uint8_t& sample = image.pixels[sample_index(image, pixel, channel)];
                 sample = nudge(sample, low, step, direction);
             }
@@ -121,11 +140,8 @@ class LsbCodec final : public Codec {
         for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
             for (int channel = 0; channel < colors; ++channel) {
                 const uint8_t low = image.pixels[sample_index(image, pixel, channel)] & mask;
-                for (int bit = k_ - 1; bit >= 0; --bit) {
-                    if (sink.size() >= bits) {
-                        return;
-                    }
-                    sink.write(((low >> bit) & 1u) != 0);
+                if (!put_bits(sink, low, k_, bits)) {
+                    return;
                 }
             }
         }
@@ -135,44 +151,63 @@ class LsbCodec final : public Codec {
     int k_;
 };
 
-/// L1: every colour channel byte is one payload byte. Maximum capacity, and the
-/// picture is destroyed — this treats the image purely as a container.
+/// L1: the top k bits of every colour channel carry k payload bits, and the bits
+/// below them are set to the middle of the bucket those top bits name. At k = 8
+/// that is one payload byte per channel — maximum capacity, and the picture is
+/// destroyed, this treats the image purely as a container.
+///
+/// Below 8 it is a robustness dial. The bucket is 2^(8-k) wide and the sample sits
+/// at its centre, so the channel can drift by half a bucket either way and still
+/// decode to the same k bits: k = 5 tolerates ±4, k = 4 tolerates ±8. Centring is
+/// the whole trick — k = 8's implicit floor placement gives away that margin, since
+/// any downward drift at all crosses into the bucket below.
+///
+/// What this does *not* fix is a lossy codec's chroma subsampling, which averages
+/// R, G and B across neighbouring pixels rather than nudging each one; see
+/// docs/RAW_BITS.md for what the measurements actually say.
 class RawCodec final : public Codec {
   public:
+    explicit RawCodec(int k) : k_(k) {
+        if (k < 1 || k > 8) {
+            throw std::runtime_error("raw bits must be between 1 and 8");
+        }
+    }
+
     std::size_t capacity(const Image& image) const override {
-        return image.pixel_count() * static_cast<std::size_t>(image.color_channels());
+        return image.pixel_count() * static_cast<std::size_t>(image.color_channels()) *
+               static_cast<std::size_t>(k_) / 8;
     }
 
     void embed(Image& image, BitReader& source) const override {
         const int colors = image.color_channels();
+        const int step = 1 << (8 - k_);
         for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
             for (int channel = 0; channel < colors; ++channel) {
-                if (source.remaining() < 8) {
+                if (source.exhausted()) {
                     return;
                 }
-                uint8_t byte = 0;
-                for (int bit = 0; bit < 8; ++bit) {
-                    byte = static_cast<uint8_t>(byte << 1 | (source.read() ? 1u : 0u));
-                }
-                image.pixels[sample_index(image, pixel, channel)] = byte;
+                const int bucket = take_bits(source, k_);
+                image.pixels[sample_index(image, pixel, channel)] =
+                    static_cast<uint8_t>(bucket * step + step / 2);
             }
         }
     }
 
     void extract(const Image& image, BitWriter& sink, std::size_t bits) const override {
         const int colors = image.color_channels();
+        const int step = 1 << (8 - k_);
         for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
             for (int channel = 0; channel < colors; ++channel) {
-                if (sink.size() >= bits) {
+                const int bucket = image.pixels[sample_index(image, pixel, channel)] / step;
+                if (!put_bits(sink, static_cast<uint8_t>(bucket), k_, bits)) {
                     return;
-                }
-                const uint8_t byte = image.pixels[sample_index(image, pixel, channel)];
-                for (int bit = 7; bit >= 0; --bit) {
-                    sink.write(((byte >> bit) & 1u) != 0);
                 }
             }
         }
     }
+
+  private:
+    int k_;
 };
 
 }  // namespace
@@ -182,7 +217,9 @@ std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
         case Mode::Binary:
             return std::make_unique<BinaryCodec>();
         case Mode::Raw:
-            return std::make_unique<RawCodec>();
+            // param 0 is what raw wrote before it had a bit depth, and it means the
+            // full 8 bits — byte-for-byte the same pixels, so old carriers still read.
+            return std::make_unique<RawCodec>(param == 0 ? 8 : param);
         case Mode::Lsb:
             return std::make_unique<LsbCodec>(param);
         case Mode::Qim:
@@ -199,6 +236,9 @@ namespace {
 /// wrong k fails the `param == k` self-consistency check in detect_codec.
 std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
     std::vector<std::pair<Mode, uint8_t>> candidates = {{Mode::Binary, 0}, {Mode::Raw, 0}};
+    for (uint8_t k = 1; k <= 8; ++k) {
+        candidates.emplace_back(Mode::Raw, k);
+    }
     for (uint8_t k = 1; k <= 4; ++k) {
         candidates.emplace_back(Mode::Lsb, k);
     }

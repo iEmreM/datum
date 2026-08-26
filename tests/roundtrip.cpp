@@ -189,6 +189,62 @@ bool test_payload_roundtrip(const std::filesystem::path& dir) {
     return true;
 }
 
+/// Raw's bit depth: the top k bits of a channel carry payload and the bits below
+/// are centred in the bucket those name. Both halves of that claim are checked —
+/// the payload comes back, and it still comes back after every sample has drifted
+/// by as much as the bucket allows. The margin is the entire reason k < 8 exists.
+bool test_raw_bits(const std::filesystem::path& dir) {
+    for (int k = 1; k <= 8; ++k) {
+        for (int channels = 1; channels <= 4; ++channels) {
+            // 64x64x1 at k = 1 holds 512 bytes; stay under that tightest case.
+            const std::vector<uint8_t> payload = make_noise(400, 88u);
+            datum::Image image = make_image(64, 64, channels);
+
+            datum::embed_payload(image, datum::Mode::Raw, static_cast<uint8_t>(k), payload);
+
+            const auto file = dir / "raw.png";
+            datum::save_png(file, image);
+            const datum::Image reloaded = datum::load(file);
+
+            // Auto-detection must recover both the mode and k from the header.
+            const datum::Extracted found = datum::extract_payload(reloaded, std::nullopt);
+            CHECK(found.header.mode == datum::Mode::Raw);
+            CHECK(found.header.param == static_cast<uint8_t>(k));
+            CHECK(found.payload == payload);
+
+            // A bucket is 2^(8-k) wide and the sample sits at its centre, so there
+            // is room for half a bucket up and half a bucket down. Push every
+            // sample — header included — to the very edge of that room, alternating
+            // direction so no drift can cancel out, and it must still decode.
+            const int room = (1 << (8 - k)) / 2;
+            if (room == 0) {
+                continue;  // k = 8: bucket of 1, no margin at all — that is the point
+            }
+            datum::Image drifted = reloaded;
+            for (std::size_t i = 0; i < drifted.pixels.size(); ++i) {
+                const int push = i % 2 == 0 ? room - 1 : -room;
+                drifted.pixels[i] = static_cast<uint8_t>(drifted.pixels[i] + push);
+            }
+            CHECK(datum::extract_payload(drifted, std::nullopt).payload == payload);
+
+            // One step past the edge has to break, or the margin above proves
+            // nothing about where the boundary actually is.
+            datum::Image over = reloaded;
+            for (auto& sample : over.pixels) {
+                sample = static_cast<uint8_t>(sample - room - 1);
+            }
+            try {
+                datum::extract_payload(over, std::nullopt);
+                std::cerr << "FAILED: raw k=" << k << " decoded past its bucket\n";
+                return false;
+            } catch (const std::exception&) {
+                // expected
+            }
+        }
+    }
+    return true;
+}
+
 bool test_lsb_roundtrip(const std::filesystem::path& dir) {
     // k = 3 is the interesting one: 8·bytes is not a multiple of 3, so the final
     // bit group is partial and its alignment is exercised.
@@ -535,12 +591,12 @@ int main() {
     const auto dir = std::filesystem::temp_directory_path() / "datum_tests";
     std::filesystem::create_directories(dir);
 
-    const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
-                        test_reports_missing_file(dir) && test_crc32() && test_header() &&
-                        test_bitstream() && test_payload_roundtrip(dir) &&
-                        test_lsb_roundtrip(dir) && test_lsb_is_quiet() && test_steganalysis() &&
-                        test_alpha_is_untouched() && test_rejects_oversized_payload() &&
-                        test_detects_corruption() && test_video_roundtrip(dir);
+    const bool passed =
+        test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
+        test_reports_missing_file(dir) && test_crc32() && test_header() && test_bitstream() &&
+        test_payload_roundtrip(dir) && test_lsb_roundtrip(dir) && test_raw_bits(dir) &&
+        test_lsb_is_quiet() && test_steganalysis() && test_alpha_is_untouched() &&
+        test_rejects_oversized_payload() && test_detects_corruption() && test_video_roundtrip(dir);
 
     std::filesystem::remove_all(dir);
     std::cout << (passed ? "all checks passed\n" : "checks failed\n");
