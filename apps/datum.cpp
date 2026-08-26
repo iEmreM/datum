@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <cmath>
 #include <exception>
 #include <filesystem>
+#include <initializer_list>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -40,7 +42,16 @@ void print_usage() {
                  "  DATUM_FFPROBE pointing at them)\n";
 }
 
-Flags parse_flags(int argc, char** argv, int first) {
+/// Parses `-name value` pairs, rejecting any flag this command does not accept.
+///
+/// Silently ignoring an unknown flag is the worst thing this parser could do:
+/// `--bit 4` instead of `--bits 4` would embed at the default depth and report
+/// success, so you would only find out when the numbers made no sense.
+Flags parse_flags(int argc,
+                  char** argv,
+                  int first,
+                  const std::string& command,
+                  std::initializer_list<std::string_view> accepted) {
     Flags flags;
     for (int i = first; i < argc; ++i) {
         const std::string token = argv[i];
@@ -48,8 +59,17 @@ Flags parse_flags(int argc, char** argv, int first) {
             throw std::runtime_error("unexpected argument: " + token);
         }
         const std::string name = token.substr(token.rfind("--", 0) == 0 ? 2 : 1);
+        if (std::find(accepted.begin(), accepted.end(), name) == accepted.end()) {
+            std::string known;
+            for (const std::string_view flag : accepted) {
+                known += (known.empty() ? "" : " ") + std::string(flag.size() == 1 ? "-" : "--") +
+                         std::string(flag);
+            }
+            throw std::runtime_error("unknown flag " + token + " for '" + command +
+                                     "' (accepts: " + known + ")");
+        }
         if (i + 1 >= argc) {
-            throw std::runtime_error("missing value for -" + name);
+            throw std::runtime_error("missing value for " + token);
         }
         flags[name] = argv[++i];
     }
@@ -159,7 +179,7 @@ int run_embed(const Flags& flags) {
     if (datum::is_video(input)) {
         const datum::VideoStats stats = datum::embed_video(input, output, mode, param, payload);
         std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode)
-                  << " mode across " << stats.frames << " frames";
+                  << " mode, filling " << stats.frames_used << " of " << stats.frames << " frames";
         print_distortion(stats.psnr);
         std::cout << "\n";
         return 0;
@@ -208,18 +228,17 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const Flags flags = parse_flags(argc, argv, 2);
         if (command == "info") {
-            return run_info(flags);
+            return run_info(parse_flags(argc, argv, 2, command, {"i"}));
         }
         if (command == "capacity") {
-            return run_capacity(flags);
+            return run_capacity(parse_flags(argc, argv, 2, command, {"i", "mode", "bits"}));
         }
         if (command == "embed") {
-            return run_embed(flags);
+            return run_embed(parse_flags(argc, argv, 2, command, {"i", "o", "d", "mode", "bits"}));
         }
         if (command == "extract") {
-            return run_extract(flags);
+            return run_extract(parse_flags(argc, argv, 2, command, {"i", "o", "mode"}));
         }
         std::cerr << "error: unknown command: " << command << "\n\n";
         print_usage();

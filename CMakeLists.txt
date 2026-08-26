@@ -42,3 +42,10 @@ add_executable(datum_tests tests/roundtrip.cpp)
 target_link_libraries(datum_tests PRIVATE datum_core)
 target_compile_options(datum_tests PRIVATE ${DATUM_WARNINGS})
 add_test(NAME roundtrip COMMAND datum_tests)
+
+# A silently ignored flag once made `--bit 4` embed at the default depth and
+# still report success. Guard the parser at the CLI level, where the bug lived.
+add_test(NAME cli_rejects_unknown_flag
+         COMMAND datum embed -i cover.png -o out.png -d payload.bin --bit 4)
+set_tests_properties(cli_rejects_unknown_flag PROPERTIES
+                     PASS_REGULAR_EXPRESSION "unknown flag --bit")

@@ -285,6 +285,7 @@ VideoStats embed_video(const std::filesystem::path& in,
             // whole video, exactly as it is for a still image.
             before = frame.pixels;
             codec->embed(frame, source);
+            ++stats.frames_used;
             for (std::size_t i = 0; i < frame.pixels.size(); ++i) {
                 const double diff =
                     static_cast<double>(before[i]) - static_cast<double>(frame.pixels[i]);

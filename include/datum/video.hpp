@@ -37,8 +37,9 @@ VideoInfo probe(const std::filesystem::path& file);
 std::size_t video_capacity(const VideoInfo& info, Mode mode, uint8_t param);
 
 struct VideoStats {
-    std::size_t frames = 0;  ///< frames written
-    double psnr = 0.0;       ///< over the whole video, +infinity if untouched
+    std::size_t frames = 0;       ///< frames written, i.e. the video's length
+    std::size_t frames_used = 0;  ///< frames the payload actually reached into
+    double psnr = 0.0;            ///< over the whole video, +infinity if untouched
 };
 
 /// Streams `in` through ffmpeg frame by frame, embedding as it goes, and writes
