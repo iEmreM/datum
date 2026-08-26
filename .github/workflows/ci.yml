@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    name: windows / mingw-ucrt64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-ffmpeg
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  linux:
+    name: linux / gcc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The video tests skip themselves without ffmpeg; install it so they run.
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install clang-format
+      # third_party/ is vendored upstream code and is deliberately not reformatted.
+      - run: |
+          find include src apps tests -name '*.hpp' -o -name '*.cpp' \
+            | xargs clang-format --dry-run --Werror
