@@ -21,7 +21,12 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_link_options(-static-libgcc -static-libstdc++ -static)
 endif()
 
-add_library(datum_core src/image.cpp)
+add_library(datum_core
+    src/codecs.cpp
+    src/container.cpp
+    src/image.cpp
+    src/io.cpp
+)
 target_include_directories(datum_core PUBLIC include)
 # SYSTEM: stb is third-party, its warnings must not trip our -Werror.
 target_include_directories(datum_core SYSTEM PRIVATE third_party/stb)

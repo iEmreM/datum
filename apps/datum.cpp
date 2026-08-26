@@ -1,9 +1,14 @@
 #include <exception>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "datum/codec.hpp"
+#include "datum/container.hpp"
 #include "datum/image.hpp"
+#include "datum/io.hpp"
 
 namespace {
 
@@ -11,9 +16,17 @@ namespace {
 using Flags = std::map<std::string, std::string, std::less<>>;
 
 void print_usage() {
-    std::cerr << "datum — embed data inside pixel values\n\n"
+    std::cerr << "datum — embed data inside pixel values\n"
+                 "\n"
                  "usage:\n"
-                 "  datum info -i <image>    describe an image and its raw capacity\n";
+                 "  datum info     -i <image>\n"
+                 "  datum capacity -i <image> [--mode binary|raw]\n"
+                 "  datum embed    -i <cover> -o <stego.png> -d <payload> [--mode binary|raw]\n"
+                 "  datum extract  -i <stego.png> -o <payload> [--mode binary|raw]\n"
+                 "\n"
+                 "notes:\n"
+                 "  output must be .png — lossy formats would erase the payload\n"
+                 "  extract auto-detects the mode unless --mode is given\n";
 }
 
 Flags parse_flags(int argc, char** argv, int first) {
@@ -40,12 +53,71 @@ const std::string& require(const Flags& flags, const std::string& name) {
     return found->second;
 }
 
+const std::string* find_flag(const Flags& flags, const std::string& name) {
+    const auto found = flags.find(name);
+    return found == flags.end() ? nullptr : &found->second;
+}
+
+datum::Mode require_mode(const Flags& flags, datum::Mode fallback) {
+    const std::string* name = find_flag(flags, "mode");
+    if (name == nullptr) {
+        return fallback;
+    }
+    const auto mode = datum::mode_from_name(*name);
+    if (!mode) {
+        throw std::runtime_error("unknown mode: " + *name);
+    }
+    return *mode;
+}
+
+// ponytail: argv is ANSI on Windows, so non-ASCII paths mangle here even though the
+// image and io layers are wide-path clean. Switch to wmain/GetCommandLineW if it bites.
+
 int run_info(const Flags& flags) {
-    // ponytail: argv is ANSI on Windows, so non-ASCII paths mangle here even though
-    // the image layer is wide-path clean. Switch to wmain/GetCommandLineW if it bites.
     const datum::Image image = datum::load(require(flags, "i"));
-    std::cout << image.width << "x" << image.height << ", " << image.channels << " channel(s)\n"
+    std::cout << image.width << "x" << image.height << ", " << image.channels << " channel(s), "
+              << image.color_channels() << " usable\n"
               << image.pixel_count() << " pixels, " << image.sample_count() << " channel bytes\n";
+    return 0;
+}
+
+int run_capacity(const Flags& flags) {
+    const datum::Image image = datum::load(require(flags, "i"));
+    const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
+    const auto codec = datum::make_codec(mode, 0);
+
+    const std::size_t total = codec->capacity(image);
+    const std::size_t payload = total > datum::kHeaderSize ? total - datum::kHeaderSize : 0;
+    std::cout << datum::mode_name(mode) << ": " << payload << " payload bytes (" << payload / 1024
+              << " KiB), " << datum::kHeaderSize << " byte header\n";
+    return 0;
+}
+
+int run_embed(const Flags& flags) {
+    datum::Image image = datum::load(require(flags, "i"));
+    const std::vector<uint8_t> payload = datum::read_bytes(require(flags, "d"));
+    const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
+
+    datum::embed_payload(image, mode, 0, payload);
+    datum::save_png(require(flags, "o"), image);
+
+    std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode)
+              << " mode\n";
+    return 0;
+}
+
+int run_extract(const Flags& flags) {
+    const datum::Image image = datum::load(require(flags, "i"));
+    std::optional<datum::Mode> mode;
+    if (find_flag(flags, "mode") != nullptr) {
+        mode = require_mode(flags, datum::Mode::Raw);
+    }
+
+    const datum::Extracted result = datum::extract_payload(image, mode);
+    datum::write_bytes(require(flags, "o"), result.payload);
+
+    std::cout << "extracted " << result.payload.size() << " bytes from "
+              << datum::mode_name(result.header.mode) << " mode, CRC ok\n";
     return 0;
 }
 
@@ -58,15 +130,32 @@ int main(int argc, char** argv) {
     }
 
     const std::string command = argv[1];
+    if (command == "-h" || command == "--help" || command == "help") {
+        print_usage();
+        return 0;
+    }
+
     try {
         const Flags flags = parse_flags(argc, argv, 2);
         if (command == "info") {
             return run_info(flags);
         }
-        throw std::runtime_error("unknown command: " + command);
-    } catch (const std::exception& error) {
-        std::cerr << "error: " << error.what() << "\n\n";
+        if (command == "capacity") {
+            return run_capacity(flags);
+        }
+        if (command == "embed") {
+            return run_embed(flags);
+        }
+        if (command == "extract") {
+            return run_extract(flags);
+        }
+        std::cerr << "error: unknown command: " << command << "\n\n";
         print_usage();
+        return 2;
+    } catch (const std::exception& error) {
+        // No usage dump here: by this point the command parsed fine and the
+        // failure is operational, so the message is the useful part.
+        std::cerr << "error: " << error.what() << "\n";
         return 1;
     }
 }

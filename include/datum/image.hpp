@@ -18,9 +18,14 @@ struct Image {
         return static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     }
 
-    /// Number of channel bytes an embedder may write into.
     std::size_t sample_count() const {
         return pixel_count() * static_cast<std::size_t>(channels);
+    }
+
+    /// Channels a codec may write into: the alpha channel is excluded, because
+    /// altering it changes which pixels are drawn at all, not just their colour.
+    int color_channels() const {
+        return channels == 2 || channels == 4 ? channels - 1 : channels;
     }
 
     bool empty() const {

@@ -9,36 +9,14 @@
 
 #include <algorithm>
 #include <cctype>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
+#include "datum/io.hpp"
+
 namespace datum {
 namespace {
-
-// std::fstream takes the path object directly, so wide paths on Windows keep
-// working. stb only sees bytes, never a filename.
-std::vector<uint8_t> read_file(const std::filesystem::path& file) {
-    std::ifstream in(file, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("cannot open " + file.string());
-    }
-    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
-
-void write_file(const std::filesystem::path& file, const std::vector<uint8_t>& bytes) {
-    std::ofstream out(file, std::ios::binary);
-    if (!out) {
-        throw std::runtime_error("cannot create " + file.string());
-    }
-    out.write(reinterpret_cast<const char*>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size()));
-    if (!out) {
-        throw std::runtime_error("cannot write " + file.string());
-    }
-}
 
 void append_to_vector(void* context, void* data, int size) {
     auto* out = static_cast<std::vector<uint8_t>*>(context);
@@ -56,7 +34,7 @@ std::string lowercase(std::string text) {
 }  // namespace
 
 Image load(const std::filesystem::path& file) {
-    const std::vector<uint8_t> encoded = read_file(file);
+    const std::vector<uint8_t> encoded = read_bytes(file);
     if (encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error(file.string() + " is too large to decode");
     }
@@ -102,7 +80,7 @@ void save_png(const std::filesystem::path& file, const Image& image) {
                                stride) == 0) {
         throw std::runtime_error("cannot encode " + file.string() + " as PNG");
     }
-    write_file(file, encoded);
+    write_bytes(file, encoded);
 }
 
 }  // namespace datum
