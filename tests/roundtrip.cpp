@@ -1,6 +1,8 @@
 // The one check the whole project rests on: a payload embedded into an image and
 // read back out is byte-identical, through a real PNG save/load in between.
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -10,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "datum/analyze.hpp"
 #include "datum/bitstream.hpp"
 #include "datum/codec.hpp"
 #include "datum/container.hpp"
@@ -212,6 +215,114 @@ bool test_lsb_roundtrip(const std::filesystem::path& dir) {
             CHECK(forced.payload == payload);
         }
     }
+    return true;
+}
+
+/// A photo-like cover: smooth shading with a little grain. RS analysis measures how
+/// neighbouring samples correlate, so the flat noise the other tests use would tell
+/// it nothing at all — every block is already as noisy as it can get.
+datum::Image make_photo(int width, int height, uint32_t seed = 0x9E37u) {
+    datum::Image image;
+    image.width = width;
+    image.height = height;
+    image.channels = 3;
+    image.pixels.resize(image.sample_count());
+
+    uint32_t state = seed;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                state = state * 1664525u + 1013904223u;
+                const double grain = static_cast<double>(state >> 24) / 255.0 * 6.0 - 3.0;
+                const double value = 120.0 + 70.0 * std::sin(x / 21.0) + 50.0 * std::cos(y / 17.0) +
+                                     18.0 * std::sin((x + y) / 9.0) + 12.0 * c + grain;
+                image.pixels[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+                    static_cast<uint8_t>(std::clamp(value, 0.0, 255.0));
+            }
+        }
+    }
+
+    // A camera's tone curve is not a straight line: neighbouring output values
+    // collect unequal shares of the input range, and that is what makes a real
+    // photograph's histogram jagged. A perfectly smooth synthetic histogram is the
+    // one cover where a ±1 nudge is easy to spot, so this is not decoration.
+    std::array<uint8_t, 256> curve{};
+    double level = 0.0;
+    for (int value = 0; value < 256; ++value) {
+        curve[value] = static_cast<uint8_t>(std::clamp(level, 0.0, 255.0));
+        state = state * 1664525u + 1013904223u;
+        level += 0.4 + 1.2 * (static_cast<double>(state >> 24) / 255.0);
+    }
+    for (auto& sample : image.pixels) {
+        sample = curve[sample];
+    }
+    return image;
+}
+
+/// LSB *replacement* over the first `samples` samples — what datum did before
+/// Phase 4, kept here as the thing the analysis has to keep catching.
+datum::Image replace_low_bits(datum::Image image, std::size_t samples, uint32_t seed) {
+    uint32_t state = seed;
+    for (std::size_t i = 0; i < samples && i < image.pixels.size(); ++i) {
+        state = state * 1664525u + 1013904223u;
+        image.pixels[i] = static_cast<uint8_t>((image.pixels[i] & 0xFEu) | ((state >> 24) & 1u));
+    }
+    return image;
+}
+
+/// Phase 4's goal, stated as a test: our own stego must sit inside the same noise
+/// band as the clean cover, while LSB replacement at the same fill does not.
+///
+/// Both halves matter. Without the replacement case the first half only proves the
+/// analysis is blind; without the stego case the analysis proves nothing about us.
+bool test_steganalysis() {
+    const datum::Image cover = make_photo(256, 256);
+    const std::size_t tenth = cover.pixels.size() / 10;
+
+    const datum::Analysis clean = datum::analyze(cover);
+    CHECK(clean.chi.p_embedded < 0.5);
+    CHECK(clean.rs.rate < 0.10);
+    CHECK(clean.rs.regular - clean.rs.singular > 0.15);
+
+    // Chi-square has to keep catching the replacement it was written for. At full
+    // fill it is unmistakable — and so is RS, though not through its rate estimate:
+    // that breaks down at p = 1, where the R and S curves cross and the quadratic
+    // has no root left in range. What is unambiguous is that they met at all.
+    const datum::Analysis full = datum::analyze(replace_low_bits(cover, cover.pixels.size(), 11u));
+    CHECK(full.chi.p_embedded > 0.9);
+    CHECK(std::abs(full.rs.regular - full.rs.singular) < 0.05);
+
+    // Half filled is where the rate estimate is at its best.
+    const datum::Analysis half =
+        datum::analyze(replace_low_bits(cover, cover.pixels.size() / 2, 13u));
+    CHECK(half.rs.rate > 0.30);
+
+    // A tenth of the image is averaged into nothing by a whole-image histogram, so
+    // catching it is entirely down to the prefix scan — assert that it also landed
+    // near where the payload stops.
+    const datum::Analysis part = datum::analyze(replace_low_bits(cover, tenth, 12u));
+    CHECK(part.chi.p_embedded > 0.9);
+    CHECK(part.chi.prefix < 0.30);
+
+    // Phase 4's claim: the same fill through our own codec leaves RS with nothing.
+    // Its estimate stays on the clean cover's baseline instead of tracking the
+    // payload, and R and S never converge the way replacement makes them.
+    //
+    // Chi-square is deliberately not asserted against our output. It is defeated on
+    // a real photograph — measured at p = 0.000 for every fill, against 1.000 for
+    // replacement — but on a generated cover with a smoother histogram the ±1 nudge
+    // is enough to even out the value pairs and it still fires. Asserting it would
+    // pin down this fixture rather than the codec.
+    datum::Image stego = cover;
+    datum::embed_payload(stego, datum::Mode::Lsb, 1, make_noise(tenth / 8, 41u));
+    CHECK(datum::analyze(stego).rs.rate < clean.rs.rate + 0.05);
+
+    datum::Image filled = cover;
+    datum::embed_payload(
+        filled, datum::Mode::Lsb, 1, make_noise(cover.pixels.size() / 8 - datum::kHeaderSize, 42u));
+    const datum::Analysis hidden = datum::analyze(filled);
+    CHECK(hidden.rs.rate < 0.15);
+    CHECK(hidden.rs.regular - hidden.rs.singular > 0.10);
     return true;
 }
 
@@ -427,7 +538,7 @@ int main() {
     const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
                         test_reports_missing_file(dir) && test_crc32() && test_header() &&
                         test_bitstream() && test_payload_roundtrip(dir) &&
-                        test_lsb_roundtrip(dir) && test_lsb_is_quiet() &&
+                        test_lsb_roundtrip(dir) && test_lsb_is_quiet() && test_steganalysis() &&
                         test_alpha_is_untouched() && test_rejects_oversized_payload() &&
                         test_detects_corruption() && test_video_roundtrip(dir);
 

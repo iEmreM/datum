@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,6 +14,34 @@ namespace {
 
 std::size_t sample_index(const Image& image, std::size_t pixel, int channel) {
     return pixel * static_cast<std::size_t>(image.channels) + static_cast<std::size_t>(channel);
+}
+
+/// Moves `sample` to the nearest value whose low k bits are `low`, instead of
+/// overwriting them: LSB *matching* rather than LSB replacement.
+///
+/// Replacement drives the counts of each value pair (2i, 2i+1) toward equality,
+/// which is exactly what chi-square and RS analysis look for and is a pattern no
+/// natural image has. Adding or subtracting leaves no such pair to equalise:
+/// measured on a real photograph, it takes chi-square from p = 1.000 to p = 0.000.
+/// It is also quieter — at most 2^(k-1) off instead of 2^k - 1, worth 2.7 dB at
+/// k = 4 — and extraction is unchanged, because the low bits end up the same
+/// either way. See `datum analyze` for what this does and does not buy.
+///
+/// At k = 1 the two candidates are always equidistant, so `direction` is the whole
+/// decision; it breaks ties only, and nothing secret rides on it.
+uint8_t nudge(uint8_t sample, uint8_t low, int step, std::minstd_rand& direction) {
+    const int up_by = (low - (sample & (step - 1)) + step) % step;
+    if (up_by == 0) {
+        return sample;  // the low bits already say what we want
+    }
+    const int down_by = step - up_by;
+    const int up = sample + up_by;
+    // Only one of the two can fall outside 0..255: reaching past 255 needs a large
+    // sample, reaching below 0 needs a small one.
+    const bool go_up =
+        sample < down_by ||
+        (up <= 255 && (up_by < down_by || (up_by == down_by && (direction() & 1u) != 0u)));
+    return static_cast<uint8_t>(go_up ? up : sample - down_by);
 }
 
 /// L0: one bit per pixel, painted as full black or full white. The image becomes
@@ -44,7 +73,7 @@ class BinaryCodec final : public Codec {
     }
 };
 
-/// L2: replace the low k bits of every colour channel with k payload bits. At
+/// L2: the low k bits of every colour channel carry k payload bits. At
 /// k = 1 a channel moves by at most 1 (PSNR ≈ 51 dB), which is below the threshold
 /// of human vision; higher k buys capacity at the cost of visibility. k is stored
 /// in the header, so extraction recovers it without being told.
@@ -63,7 +92,10 @@ class LsbCodec final : public Codec {
 
     void embed(Image& image, BitReader& source) const override {
         const int colors = image.color_channels();
-        const auto keep = static_cast<uint8_t>(~((1u << k_) - 1u));  // high bits kept as-is
+        const int step = 1 << k_;
+        // Fixed seed: the ± choice must be unpredictable from the pixel, not secret,
+        // and a constant one keeps embedding reproducible for the tests.
+        std::minstd_rand direction(0x5EEDu);
         for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
             for (int channel = 0; channel < colors; ++channel) {
                 if (source.exhausted()) {
@@ -78,7 +110,7 @@ class LsbCodec final : public Codec {
                 // left-aligned so extraction reads its real bits before the padding.
                 low = static_cast<uint8_t>(low << (k_ - taken));
                 uint8_t& sample = image.pixels[sample_index(image, pixel, channel)];
-                sample = static_cast<uint8_t>((sample & keep) | low);
+                sample = nudge(sample, low, step, direction);
             }
         }
     }

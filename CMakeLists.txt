@@ -22,6 +22,7 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 add_library(datum_core
+    src/analyze.cpp
     src/codecs.cpp
     src/container.cpp
     src/image.cpp

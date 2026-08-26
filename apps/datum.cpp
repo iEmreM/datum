@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "datum/analyze.hpp"
 #include "datum/codec.hpp"
 #include "datum/container.hpp"
 #include "datum/image.hpp"
@@ -31,6 +32,7 @@ void print_usage() {
                  "  datum embed    -i <cover> -o <stego> -d <payload>"
                  " [--mode binary|raw|lsb] [--bits 1..4]\n"
                  "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb]\n"
+                 "  datum analyze  -i <carrier>\n"
                  "\n"
                  "notes:\n"
                  "  a carrier is an image or a video; the extension picks which\n"
@@ -38,6 +40,8 @@ void print_usage() {
                  "  output must be .png for images and .mkv for video — lossy\n"
                  "  formats would erase the payload\n"
                  "  extract auto-detects the mode and bit depth unless --mode is given\n"
+                 "  analyze runs steganalysis on a carrier — point it at our own\n"
+                 "  output to check the hiding actually holds up\n"
                  "  video needs ffmpeg and ffprobe on PATH (or DATUM_FFMPEG /\n"
                  "  DATUM_FFPROBE pointing at them)\n";
 }
@@ -213,6 +217,41 @@ int run_extract(const Flags& flags) {
     return 0;
 }
 
+/// Steganalysis of a carrier, aimed at our own output. Both tests hunt the LSB
+/// *replacement* signature, which is what Phase 4's switch to LSB matching removed:
+/// a high reading here on a `datum`-made stego is a regression, not a curiosity.
+int run_analyze(const Flags& flags) {
+    const std::filesystem::path input = require(flags, "i");
+    const datum::Image carrier =
+        datum::is_video(input) ? datum::first_frame(input) : datum::load(input);
+    const datum::Analysis report = datum::analyze(carrier);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "chi-square:  p(replacement) = " << report.chi.p_embedded << " over "
+              << report.chi.pairs << " value pairs, worst in the first " << std::setprecision(0)
+              << report.chi.prefix * 100.0 << "%" << std::setprecision(3) << "\n"
+              << "RS analysis: " << std::setprecision(1) << report.rs.rate * 100.0
+              << "% of the low bits look like payload" << std::setprecision(3) << " (R "
+              << report.rs.regular << " / S " << report.rs.singular << ")" << "\n";
+
+    // The two tests fail in different places — chi-square is blind to LSB matching,
+    // RS over-reads it — so the verdict names which one spoke rather than merging
+    // them into one number.
+    //
+    // ponytail: flat thresholds, no calibration set behind them. Wide enough that a
+    // clean cover and a filled one land on opposite sides; tighten against real
+    // covers if this ever has to mean more than a smoke test.
+    const bool chi_flags = report.chi.p_embedded > 0.5;
+    const bool rs_flags = report.rs.rate > 0.10;
+    std::cout << "verdict:     "
+              << (chi_flags && rs_flags ? "both tests see a payload"
+                  : chi_flags           ? "chi-square sees the LSB replacement signature"
+                  : rs_flags            ? "RS analysis sees a payload"
+                                        : "clean — neither test sees a payload")
+              << "\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -239,6 +278,9 @@ int main(int argc, char** argv) {
         }
         if (command == "extract") {
             return run_extract(parse_flags(argc, argv, 2, command, {"i", "o", "mode"}));
+        }
+        if (command == "analyze") {
+            return run_analyze(parse_flags(argc, argv, 2, command, {"i"}));
         }
         std::cerr << "error: unknown command: " << command << "\n\n";
         print_usage();

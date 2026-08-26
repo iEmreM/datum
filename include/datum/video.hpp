@@ -32,6 +32,10 @@ struct VideoInfo {
 /// Runs ffprobe. Throws std::runtime_error if it fails or reports no video stream.
 VideoInfo probe(const std::filesystem::path& file);
 
+/// Decodes frame 0 alone, as rgb24, so the still-image tools can be pointed at a
+/// video. Both detection and analysis only ever need the first frame.
+Image first_frame(const std::filesystem::path& file);
+
 /// Payload bytes the whole video holds in this mode, header excluded. Returns 0
 /// when the frame count is unknown.
 std::size_t video_capacity(const VideoInfo& info, Mode mode, uint8_t param);

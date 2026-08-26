@@ -164,6 +164,19 @@ Image frame_shape(const VideoInfo& info) {
     return shape;
 }
 
+/// Decoding frame 0 with an already-probed `info`, so callers that need the rest
+/// of the info do not pay for a second probe (which demuxes the whole file).
+Image decode_first_frame(const std::filesystem::path& file, const VideoInfo& info) {
+    Image frame = frame_shape(info);
+    frame.pixels.resize(info.frame_bytes());
+    Pipe decoder(decode_command(file, 1), "rb");
+    if (!decoder.read_frame(frame.pixels)) {
+        throw std::runtime_error("no frames decoded from " + file.string());
+    }
+    decoder.close_or_throw("reading the video");
+    return frame;
+}
+
 std::string find_value(const std::string& text, const std::string& key) {
     const std::string needle = key + "=";
     std::size_t at = text.find(needle);
@@ -217,6 +230,10 @@ VideoInfo probe(const std::filesystem::path& file) {
         info.frame_rate = "25";
     }
     return info;
+}
+
+Image first_frame(const std::filesystem::path& file) {
+    return decode_first_frame(file, probe(file));
 }
 
 std::size_t video_capacity(const VideoInfo& info, Mode mode, uint8_t param) {
@@ -314,19 +331,10 @@ VideoStats embed_video(const std::filesystem::path& in,
 
 Extracted extract_video(const std::filesystem::path& in, std::optional<Mode> mode) {
     const VideoInfo info = probe(in);
-    Image frame = frame_shape(info);
-    frame.pixels.resize(info.frame_bytes());
 
     // First pass: one frame, just to learn who wrote this and how long it is.
-    std::optional<Detected> found;
-    {
-        Pipe decoder(decode_command(in, 1), "rb");
-        if (!decoder.read_frame(frame.pixels)) {
-            throw std::runtime_error("no frames decoded from " + in.string());
-        }
-        decoder.close_or_throw("reading the video");
-        found = detect_codec(frame, mode);
-    }
+    Image frame = decode_first_frame(in, info);
+    const std::optional<Detected> found = detect_codec(frame, mode);
     if (!found) {
         throw std::runtime_error(
             "no datum payload in the first frame (or the wrong mode was given)");
