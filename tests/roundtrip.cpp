@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -13,6 +14,8 @@
 #include "datum/codec.hpp"
 #include "datum/container.hpp"
 #include "datum/image.hpp"
+#include "datum/io.hpp"
+#include "datum/video.hpp"
 
 // Not <cassert>: Release defines NDEBUG and would compile the checks away.
 #define CHECK(condition)                                                                         \
@@ -281,17 +284,152 @@ bool test_detects_corruption() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Video. These need ffmpeg, so they report a skip rather than a failure when it
+// is missing — a contributor without ffmpeg should still be able to run the suite.
+// ---------------------------------------------------------------------------
+
+std::string tool(const char* variable, const char* fallback) {
+    const char* value = std::getenv(variable);
+    return value != nullptr && value[0] != '\0' ? std::string(value) : std::string(fallback);
+}
+
+#ifdef _WIN32
+constexpr const char* kNullDevice = "NUL";
+#else
+constexpr const char* kNullDevice = "/dev/null";
+#endif
+
+/// Runs a command with stdout sent to `target` and stderr discarded, returning
+/// true on exit status 0. Windows needs the outer quotes for the same reason the
+/// video layer does: cmd.exe eats the outermost pair.
+bool run(const std::string& command, const std::string& target) {
+    const std::string redirected = command + " > " + target + " 2> " + kNullDevice;
+#ifdef _WIN32
+    return std::system(("\"" + redirected + "\"").c_str()) == 0;
+#else
+    return std::system(redirected.c_str()) == 0;
+#endif
+}
+
+bool run_quiet(const std::string& command) {
+    return run(command, kNullDevice);
+}
+
+bool have_ffmpeg() {
+    return run_quiet("\"" + tool("DATUM_FFMPEG", "ffmpeg") + "\" -version") &&
+           run_quiet("\"" + tool("DATUM_FFPROBE", "ffprobe") + "\" -version");
+}
+
+/// A short clip with an audio track. FFV1 and PCM need no external encoders, so
+/// this works on any ffmpeg build; the point is our pipeline, not theirs.
+bool make_clip(const std::filesystem::path& file, int width, int height, int frames) {
+    const std::string size = std::to_string(width) + "x" + std::to_string(height);
+    return run_quiet("\"" + tool("DATUM_FFMPEG", "ffmpeg") +
+                     "\" -v error -y -f lavfi -i testsrc2=" + "size=" + size +
+                     ":rate=30 -f lavfi -i sine=frequency=440 -frames:v " + std::to_string(frames) +
+                     " -c:v ffv1 -pix_fmt bgr0 -c:a pcm_s16le -shortest " + "\"" + file.string() +
+                     "\"");
+}
+
+bool has_audio_track(const std::filesystem::path& file, const std::filesystem::path& scratch) {
+    const auto listing = scratch / "streams.txt";
+    if (!run("\"" + tool("DATUM_FFPROBE", "ffprobe") +
+                 "\" -v error -show_entries stream=codec_type -of csv=p=0 \"" + file.string() +
+                 "\"",
+             "\"" + listing.string() + "\"")) {
+        return false;
+    }
+    const std::vector<uint8_t> bytes = datum::read_bytes(listing);
+    return std::string(bytes.begin(), bytes.end()).find("audio") != std::string::npos;
+}
+
+bool test_video_roundtrip(const std::filesystem::path& dir) {
+    if (!have_ffmpeg()) {
+        std::cout << "  (skipped video: ffmpeg/ffprobe not found)\n";
+        return true;
+    }
+
+    const int width = 640;
+    const int height = 480;
+    const int frames = 30;
+    const auto cover = dir / "clip.mkv";
+    CHECK(make_clip(cover, width, height, frames));
+
+    const datum::VideoInfo info = datum::probe(cover);
+    CHECK(info.width == width);
+    CHECK(info.height == height);
+    CHECK(info.frames == static_cast<std::size_t>(frames));
+    CHECK(info.frame_bytes() == static_cast<std::size_t>(width) * height * 3);
+
+    // 1 MB in lsb k=1 needs 10 of these frames, so the payload genuinely spans
+    // frames rather than fitting in the first one.
+    const std::size_t per_frame = static_cast<std::size_t>(width) * height * 3 / 8;
+    const std::vector<uint8_t> payload = make_noise(1024 * 1024, 4242u);
+    CHECK(payload.size() > per_frame);
+    CHECK(datum::video_capacity(info, datum::Mode::Lsb, 1) > payload.size());
+
+    const auto stego = dir / "stego.mkv";
+    const datum::VideoStats stats = datum::embed_video(cover, stego, datum::Mode::Lsb, 1, payload);
+    CHECK(stats.frames == static_cast<std::size_t>(frames));
+    CHECK(stats.psnr > 50.0);
+
+    // Auto-detection, then the CRC, then the bytes themselves.
+    const datum::Extracted found = datum::extract_video(stego, std::nullopt);
+    CHECK(found.header.mode == datum::Mode::Lsb);
+    CHECK(found.header.param == 1);
+    CHECK(found.payload == payload);
+
+    // Every frame must survive, and so must the audio the user never asked us
+    // to touch — dropping it would be silent data loss.
+    const datum::VideoInfo after = datum::probe(stego);
+    CHECK(after.frames == static_cast<std::size_t>(frames));
+    CHECK(after.width == width);
+    CHECK(after.height == height);
+    CHECK(has_audio_track(stego, dir));
+
+    // A clip with nothing hidden in it must not look like it has a payload.
+    try {
+        datum::extract_video(cover, std::nullopt);
+        std::cerr << "FAILED: extract_video found a payload in an untouched clip\n";
+        return false;
+    } catch (const std::exception&) {
+        // expected
+    }
+
+    // Lossy output would quantise the payload away, so it is refused outright.
+    try {
+        datum::embed_video(cover, dir / "no.mp4", datum::Mode::Lsb, 1, payload);
+        std::cerr << "FAILED: embed_video accepted a lossy destination\n";
+        return false;
+    } catch (const std::exception&) {
+        // expected
+    }
+
+    // Oversized must fail before any encoding starts, not truncate.
+    try {
+        datum::embed_video(
+            cover, dir / "no.mkv", datum::Mode::Lsb, 1, make_noise(64u * 1024 * 1024, 1u));
+        std::cerr << "FAILED: embed_video accepted an oversized payload\n";
+        return false;
+    } catch (const std::exception&) {
+        // expected
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
     const auto dir = std::filesystem::temp_directory_path() / "datum_tests";
     std::filesystem::create_directories(dir);
 
-    const bool passed =
-        test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
-        test_reports_missing_file(dir) && test_crc32() && test_header() && test_bitstream() &&
-        test_payload_roundtrip(dir) && test_lsb_roundtrip(dir) && test_lsb_is_quiet() &&
-        test_alpha_is_untouched() && test_rejects_oversized_payload() && test_detects_corruption();
+    const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
+                        test_reports_missing_file(dir) && test_crc32() && test_header() &&
+                        test_bitstream() && test_payload_roundtrip(dir) &&
+                        test_lsb_roundtrip(dir) && test_lsb_is_quiet() &&
+                        test_alpha_is_untouched() && test_rejects_oversized_payload() &&
+                        test_detects_corruption() && test_video_roundtrip(dir);
 
     std::filesystem::remove_all(dir);
     std::cout << (passed ? "all checks passed\n" : "checks failed\n");

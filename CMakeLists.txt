@@ -26,6 +26,7 @@ add_library(datum_core
     src/container.cpp
     src/image.cpp
     src/io.cpp
+    src/video.cpp
 )
 target_include_directories(datum_core PUBLIC include)
 # SYSTEM: stb is third-party, its warnings must not trip our -Werror.

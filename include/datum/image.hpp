@@ -41,6 +41,11 @@ Image load(const std::filesystem::path& file);
 /// Throws std::runtime_error on failure.
 void save_png(const std::filesystem::path& file, const Image& image);
 
+/// Peak signal-to-noise ratio in dB from an already-accumulated error total, so a
+/// video can sum across frames without holding them all. Returns +infinity when
+/// there is no error at all.
+double psnr_from_squared_error(double sum_squared_error, std::size_t samples);
+
 /// Peak signal-to-noise ratio in dB between two equally sized images, over every
 /// sample. Higher means less distortion; above ~50 dB the change is below the
 /// threshold of human vision. Returns +infinity when the images are identical.

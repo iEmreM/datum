@@ -35,8 +35,10 @@ class BinaryCodec final : public Codec {
     }
 
     void extract(const Image& image, BitWriter& sink, std::size_t bits) const override {
-        const std::size_t count = std::min(bits, image.pixel_count());
-        for (std::size_t pixel = 0; pixel < count; ++pixel) {
+        for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
+            if (sink.size() >= bits) {
+                return;
+            }
             sink.write(image.pixels[sample_index(image, pixel, 0)] >= 128);
         }
     }
@@ -160,9 +162,9 @@ std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
 
 namespace {
 
-/// (mode, param) pairs `extract` tries when no mode is forced, cheapest first. lsb
-/// records its k in the header, so every k is a distinct guess: a header parsed at
-/// the wrong k fails the `param == k` self-consistency check below.
+/// (mode, param) pairs to try when no mode is forced, cheapest first. lsb records
+/// its k in the header, so every k is a distinct guess: a header parsed at the
+/// wrong k fails the `param == k` self-consistency check in detect_codec.
 std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
     std::vector<std::pair<Mode, uint8_t>> candidates = {{Mode::Binary, 0}, {Mode::Raw, 0}};
     for (uint8_t k = 1; k <= 4; ++k) {
@@ -183,6 +185,41 @@ std::optional<Header> peek_header(const Image& image, const Codec& codec) {
 }
 
 }  // namespace
+
+std::optional<Detected> detect_codec(const Image& carrier, std::optional<Mode> forced) {
+    for (const auto& [candidate, param] : detection_candidates()) {
+        if (forced && *forced != candidate) {
+            continue;
+        }
+        auto attempt = make_codec(candidate, param);
+        // The header must agree with the codec that read it — same mode, same
+        // parameter — or a chance match on the magic would be taken as a payload.
+        if (auto found = peek_header(carrier, *attempt);
+            found && found->mode == candidate && found->param == param) {
+            return Detected{std::move(attempt), *found};
+        }
+    }
+    return std::nullopt;
+}
+
+Extracted verify_payload(const Header& header, std::span<const uint8_t> stream) {
+    if (stream.size() < kHeaderSize + header.payload_len) {
+        throw std::runtime_error("payload is shorter than its header claims");
+    }
+
+    Extracted result;
+    result.header = header;
+    result.payload.assign(stream.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
+                          stream.begin() + static_cast<std::ptrdiff_t>(kHeaderSize) +
+                              static_cast<std::ptrdiff_t>(header.payload_len));
+
+    if (crc32(result.payload) != header.payload_crc) {
+        throw std::runtime_error(
+            "CRC mismatch — the payload is corrupted (the carrier was probably "
+            "resized or re-encoded after embedding)");
+    }
+    return result;
+}
 
 void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8_t> payload) {
     const auto codec = make_codec(mode, param);
@@ -208,50 +245,20 @@ void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8
 }
 
 Extracted extract_payload(const Image& image, std::optional<Mode> mode) {
-    std::unique_ptr<Codec> codec;
-    std::optional<Header> header;
-
-    // Both forcing a mode and auto-detecting reduce to the same scan: a forced mode
-    // just filters the candidate list. The parameter (lsb: k) is always recovered
-    // from the header, never taken from the caller — the CLI cannot know it.
-    for (const auto& [candidate, param] : detection_candidates()) {
-        if (mode && *mode != candidate) {
-            continue;
-        }
-        auto attempt = make_codec(candidate, param);
-        // The header must agree with the codec that read it — same mode, same
-        // parameter — or a chance match on the magic would be taken as a payload.
-        if (auto found = peek_header(image, *attempt);
-            found && found->mode == candidate && found->param == param) {
-            codec = std::move(attempt);
-            header = found;
-            break;
-        }
-    }
-
-    if (!header) {
+    const std::optional<Detected> found = detect_codec(image, mode);
+    if (!found) {
         throw std::runtime_error("no datum payload found (or the wrong mode was given)");
     }
 
-    const std::size_t needed = kHeaderSize + header->payload_len;
-    if (needed > codec->capacity(image)) {
-        throw std::runtime_error("header claims " + std::to_string(header->payload_len) +
+    const std::size_t needed = kHeaderSize + found->header.payload_len;
+    if (needed > found->codec->capacity(image)) {
+        throw std::runtime_error("header claims " + std::to_string(found->header.payload_len) +
                                  " payload bytes, more than this image can hold");
     }
 
     BitWriter sink;
-    codec->extract(image, sink, needed * 8);
-    Extracted result;
-    result.header = *header;
-    result.payload.assign(sink.bytes().begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
-                          sink.bytes().begin() + static_cast<std::ptrdiff_t>(needed));
-
-    if (crc32(result.payload) != header->payload_crc) {
-        throw std::runtime_error(
-            "CRC mismatch — the payload is corrupted (the image was probably "
-            "resized or re-encoded after embedding)");
-    }
-    return result;
+    found->codec->extract(image, sink, needed * 8);
+    return verify_payload(found->header, sink.bytes());
 }
 
 }  // namespace datum

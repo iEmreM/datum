@@ -84,12 +84,20 @@ void save_png(const std::filesystem::path& file, const Image& image) {
     write_bytes(file, encoded);
 }
 
+double psnr_from_squared_error(double sum_squared_error, std::size_t samples) {
+    if (samples == 0) {
+        throw std::runtime_error("psnr: nothing to compare");
+    }
+    if (sum_squared_error == 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double mse = sum_squared_error / static_cast<double>(samples);
+    return 10.0 * std::log10(255.0 * 255.0 / mse);
+}
+
 double psnr(const Image& a, const Image& b) {
     if (a.pixels.size() != b.pixels.size()) {
         throw std::runtime_error("psnr: images differ in size");
-    }
-    if (a.pixels.empty()) {
-        throw std::runtime_error("psnr: empty image");
     }
 
     double sum_squared_error = 0.0;
@@ -97,12 +105,7 @@ double psnr(const Image& a, const Image& b) {
         const double diff = static_cast<double>(a.pixels[i]) - static_cast<double>(b.pixels[i]);
         sum_squared_error += diff * diff;
     }
-    if (sum_squared_error == 0.0) {
-        return std::numeric_limits<double>::infinity();
-    }
-
-    const double mse = sum_squared_error / static_cast<double>(a.pixels.size());
-    return 10.0 * std::log10(255.0 * 255.0 / mse);
+    return psnr_from_squared_error(sum_squared_error, a.pixels.size());
 }
 
 }  // namespace datum

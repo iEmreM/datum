@@ -1,16 +1,19 @@
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "datum/codec.hpp"
 #include "datum/container.hpp"
 #include "datum/image.hpp"
 #include "datum/io.hpp"
+#include "datum/video.hpp"
 
 namespace {
 
@@ -21,16 +24,20 @@ void print_usage() {
     std::cerr << "datum — embed data inside pixel values\n"
                  "\n"
                  "usage:\n"
-                 "  datum info     -i <image>\n"
-                 "  datum capacity -i <image> [--mode binary|raw|lsb] [--bits 1..4]\n"
-                 "  datum embed    -i <cover> -o <stego.png> -d <payload>"
+                 "  datum info     -i <carrier>\n"
+                 "  datum capacity -i <carrier> [--mode binary|raw|lsb] [--bits 1..4]\n"
+                 "  datum embed    -i <cover> -o <stego> -d <payload>"
                  " [--mode binary|raw|lsb] [--bits 1..4]\n"
-                 "  datum extract  -i <stego.png> -o <payload> [--mode binary|raw|lsb]\n"
+                 "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb]\n"
                  "\n"
                  "notes:\n"
+                 "  a carrier is an image or a video; the extension picks which\n"
                  "  --bits sets the low bits per channel used by lsb (default 1)\n"
-                 "  output must be .png — lossy formats would erase the payload\n"
-                 "  extract auto-detects the mode and bit depth unless --mode is given\n";
+                 "  output must be .png for images and .mkv for video — lossy\n"
+                 "  formats would erase the payload\n"
+                 "  extract auto-detects the mode and bit depth unless --mode is given\n"
+                 "  video needs ffmpeg and ffprobe on PATH (or DATUM_FFMPEG /\n"
+                 "  DATUM_FFPROBE pointing at them)\n";
 }
 
 Flags parse_flags(int argc, char** argv, int first) {
@@ -94,8 +101,30 @@ uint8_t require_param(const Flags& flags, datum::Mode mode) {
 // ponytail: argv is ANSI on Windows, so non-ASCII paths mangle here even though the
 // image and io layers are wide-path clean. Switch to wmain/GetCommandLineW if it bites.
 
+void print_distortion(double db) {
+    if (std::isinf(db)) {
+        std::cout << " (unchanged)";
+    } else {
+        std::cout << ", PSNR " << std::fixed << std::setprecision(2) << db << " dB";
+    }
+}
+
+void print_capacity(std::string_view label, std::size_t payload) {
+    std::cout << label << ": " << payload << " payload bytes (" << payload / 1024 << " KiB), "
+              << datum::kHeaderSize << " byte header\n";
+}
+
 int run_info(const Flags& flags) {
-    const datum::Image image = datum::load(require(flags, "i"));
+    const std::filesystem::path input = require(flags, "i");
+    if (datum::is_video(input)) {
+        const datum::VideoInfo info = datum::probe(input);
+        std::cout << info.width << "x" << info.height << ", " << info.frames << " frames @ "
+                  << info.frame_rate << " fps\n"
+                  << info.frame_bytes() << " bytes per frame (rgb24)\n";
+        return 0;
+    }
+
+    const datum::Image image = datum::load(input);
     std::cout << image.width << "x" << image.height << ", " << image.channels << " channel(s), "
               << image.color_channels() << " usable\n"
               << image.pixel_count() << " pixels, " << image.sample_count() << " channel bytes\n";
@@ -103,47 +132,60 @@ int run_info(const Flags& flags) {
 }
 
 int run_capacity(const Flags& flags) {
-    const datum::Image image = datum::load(require(flags, "i"));
+    const std::filesystem::path input = require(flags, "i");
     const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
     const uint8_t param = require_param(flags, mode);
-    const auto codec = datum::make_codec(mode, param);
 
-    const std::size_t total = codec->capacity(image);
-    const std::size_t payload = total > datum::kHeaderSize ? total - datum::kHeaderSize : 0;
-    std::cout << datum::mode_name(mode) << ": " << payload << " payload bytes (" << payload / 1024
-              << " KiB), " << datum::kHeaderSize << " byte header\n";
+    if (datum::is_video(input)) {
+        const datum::VideoInfo info = datum::probe(input);
+        print_capacity(datum::mode_name(mode), datum::video_capacity(info, mode, param));
+        return 0;
+    }
+
+    const datum::Image image = datum::load(input);
+    const std::size_t total = datum::make_codec(mode, param)->capacity(image);
+    print_capacity(datum::mode_name(mode),
+                   total > datum::kHeaderSize ? total - datum::kHeaderSize : 0);
     return 0;
 }
 
 int run_embed(const Flags& flags) {
-    datum::Image image = datum::load(require(flags, "i"));
-    const datum::Image cover = image;  // kept only to measure the distortion below
+    const std::filesystem::path input = require(flags, "i");
+    const std::filesystem::path output = require(flags, "o");
     const std::vector<uint8_t> payload = datum::read_bytes(require(flags, "d"));
     const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
     const uint8_t param = require_param(flags, mode);
 
+    if (datum::is_video(input)) {
+        const datum::VideoStats stats = datum::embed_video(input, output, mode, param, payload);
+        std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode)
+                  << " mode across " << stats.frames << " frames";
+        print_distortion(stats.psnr);
+        std::cout << "\n";
+        return 0;
+    }
+
+    datum::Image image = datum::load(input);
+    const datum::Image cover = image;  // kept only to measure the distortion below
     datum::embed_payload(image, mode, param, payload);
-    datum::save_png(require(flags, "o"), image);
+    datum::save_png(output, image);
 
     std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode) << " mode";
-    const double db = datum::psnr(cover, image);
-    if (std::isinf(db)) {
-        std::cout << " (image unchanged)";
-    } else {
-        std::cout << ", PSNR " << std::fixed << std::setprecision(2) << db << " dB";
-    }
+    print_distortion(datum::psnr(cover, image));
     std::cout << "\n";
     return 0;
 }
 
 int run_extract(const Flags& flags) {
-    const datum::Image image = datum::load(require(flags, "i"));
+    const std::filesystem::path input = require(flags, "i");
     std::optional<datum::Mode> mode;
     if (find_flag(flags, "mode") != nullptr) {
         mode = require_mode(flags, datum::Mode::Raw);
     }
 
-    const datum::Extracted result = datum::extract_payload(image, mode);
+    const datum::Extracted result = datum::is_video(input)
+                                        ? datum::extract_video(input, mode)
+                                        : datum::extract_payload(datum::load(input), mode);
     datum::write_bytes(require(flags, "o"), result.payload);
 
     std::cout << "extracted " << result.payload.size() << " bytes from "
