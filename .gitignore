@@ -1,0 +1,29 @@
+# Build output
+build/
+out/
+cmake-build-*/
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+
+# IDE
+.vs/
+.idea/
+.cache/
+compile_commands.json
+
+# Local artifacts: never commit stego media or payloads
+samples/local/
+*.stego.png
+*.stego.mkv
+*.payload
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
