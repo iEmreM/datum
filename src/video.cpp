@@ -17,9 +17,15 @@
 #ifdef _WIN32
 #define datum_popen _popen
 #define datum_pclose _pclose
+// _popen inherits the parent's text mode; without binary, CRLF translation mangles frames.
+#define datum_read_mode "rb"
+#define datum_write_mode "wb"
 #else
 #define datum_popen popen
 #define datum_pclose pclose
+// POSIX popen takes only "r"/"w" — a "b" suffix is EINVAL, and its pipes are binary already.
+#define datum_read_mode "r"
+#define datum_write_mode "w"
 #endif
 
 namespace datum {
@@ -169,7 +175,7 @@ Image frame_shape(const VideoInfo& info) {
 Image decode_first_frame(const std::filesystem::path& file, const VideoInfo& info) {
     Image frame = frame_shape(info);
     frame.pixels.resize(info.frame_bytes());
-    Pipe decoder(decode_command(file, 1), "rb");
+    Pipe decoder(decode_command(file, 1), datum_read_mode);
     if (!decoder.read_frame(frame.pixels)) {
         throw std::runtime_error("no frames decoded from " + file.string());
     }
@@ -283,8 +289,9 @@ VideoStats embed_video(const std::filesystem::path& in,
                                  std::string(mode_name(mode)) + " mode");
     }
 
-    Pipe decoder(decode_command(in, 0), "rb");  // 0: every frame, the whole video is rewritten
-    Pipe encoder(encode_command(in, out, info), "wb");
+    // 0: every frame, the whole video is rewritten
+    Pipe decoder(decode_command(in, 0), datum_read_mode);
+    Pipe encoder(encode_command(in, out, info), datum_write_mode);
 
     Image frame = frame_shape(info);
     frame.pixels.resize(info.frame_bytes());
@@ -348,7 +355,7 @@ Extracted extract_video(const std::filesystem::path& in, std::optional<Mode> mod
 
     // Second pass: exactly the frames the payload spans, rounded up. capacity()
     // floors to whole bytes, so this can only ever over-ask, never under-ask.
-    Pipe decoder(decode_command(in, (needed + per_frame - 1) / per_frame), "rb");
+    Pipe decoder(decode_command(in, (needed + per_frame - 1) / per_frame), datum_read_mode);
     BitWriter sink;
     while (sink.size() < needed && decoder.read_frame(frame.pixels)) {
         found->codec->extract(frame, sink, needed);
