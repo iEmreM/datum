@@ -33,9 +33,6 @@ class Codec {
 /// Throws std::runtime_error for modes that are not implemented yet.
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param);
 
-/// Modes `datum extract` tries when the user did not name one, cheapest first.
-std::span<const Mode> detectable_modes();
-
 /// Prepends a DTM1 header to `payload` and writes the whole stream into `image`.
 /// Throws std::runtime_error if the payload does not fit.
 void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8_t> payload);
@@ -46,8 +43,8 @@ struct Extracted {
 };
 
 /// Recovers a payload and verifies its CRC. Pass a mode to force one, or nullopt
-/// to try `detectable_modes()`. Throws std::runtime_error when nothing valid is
-/// found or the CRC does not match.
+/// to try each known mode. Throws std::runtime_error when nothing valid is found
+/// or the CRC does not match.
 Extracted extract_payload(const Image& image, std::optional<Mode> mode);
 
 }  // namespace datum

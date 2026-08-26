@@ -41,4 +41,10 @@ Image load(const std::filesystem::path& file);
 /// Throws std::runtime_error on failure.
 void save_png(const std::filesystem::path& file, const Image& image);
 
+/// Peak signal-to-noise ratio in dB between two equally sized images, over every
+/// sample. Higher means less distortion; above ~50 dB the change is below the
+/// threshold of human vision. Returns +infinity when the images are identical.
+/// Throws std::runtime_error if the buffers differ in size.
+double psnr(const Image& a, const Image& b);
+
 }  // namespace datum

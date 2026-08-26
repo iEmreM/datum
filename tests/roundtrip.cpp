@@ -1,6 +1,7 @@
 // The one check the whole project rests on: a payload embedded into an image and
 // read back out is byte-identical, through a real PNG save/load in between.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -182,6 +183,51 @@ bool test_payload_roundtrip(const std::filesystem::path& dir) {
     return true;
 }
 
+bool test_lsb_roundtrip(const std::filesystem::path& dir) {
+    // k = 3 is the interesting one: 8·bytes is not a multiple of 3, so the final
+    // bit group is partial and its alignment is exercised.
+    for (int k = 1; k <= 4; ++k) {
+        for (int channels = 1; channels <= 4; ++channels) {
+            // 100×100×1 at k = 1 holds 1250 bytes; stay under that tightest case.
+            const std::vector<uint8_t> payload = make_noise(1000, 77u);
+            datum::Image image = make_image(100, 100, channels);
+
+            datum::embed_payload(image, datum::Mode::Lsb, static_cast<uint8_t>(k), payload);
+
+            const auto file = dir / "lsb.png";
+            datum::save_png(file, image);
+            const datum::Image reloaded = datum::load(file);
+
+            // Auto-detection must recover both the mode and k from the header.
+            const datum::Extracted found = datum::extract_payload(reloaded, std::nullopt);
+            CHECK(found.header.mode == datum::Mode::Lsb);
+            CHECK(found.header.param == static_cast<uint8_t>(k));
+            CHECK(found.payload == payload);
+
+            // Forcing lsb (without knowing k) must still work — k comes from the header.
+            const datum::Extracted forced = datum::extract_payload(reloaded, datum::Mode::Lsb);
+            CHECK(forced.payload == payload);
+        }
+    }
+    return true;
+}
+
+bool test_lsb_is_quiet() {
+    // k = 1 must be near-invisible: each touched channel moves by at most 1, so a
+    // well-filled image still sits above 50 dB — and below 60, proving it changed.
+    const datum::Image cover = make_image(256, 256, 3);
+    datum::Image stego = cover;
+    datum::embed_payload(stego, datum::Mode::Lsb, 1, make_noise(20000, 3u));
+
+    const double db = datum::psnr(cover, stego);
+    CHECK(db > 50.0);
+    CHECK(db < 60.0);
+
+    // An image compared with itself is infinitely close.
+    CHECK(std::isinf(datum::psnr(cover, cover)));
+    return true;
+}
+
 bool test_alpha_is_untouched() {
     const int channels = 4;
     const datum::Image cover = make_image(64, 64, channels);
@@ -241,11 +287,11 @@ int main() {
     const auto dir = std::filesystem::temp_directory_path() / "datum_tests";
     std::filesystem::create_directories(dir);
 
-    const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
-                        test_reports_missing_file(dir) && test_crc32() && test_header() &&
-                        test_bitstream() && test_payload_roundtrip(dir) &&
-                        test_alpha_is_untouched() && test_rejects_oversized_payload() &&
-                        test_detects_corruption();
+    const bool passed =
+        test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
+        test_reports_missing_file(dir) && test_crc32() && test_header() && test_bitstream() &&
+        test_payload_roundtrip(dir) && test_lsb_roundtrip(dir) && test_lsb_is_quiet() &&
+        test_alpha_is_untouched() && test_rejects_oversized_payload() && test_detects_corruption();
 
     std::filesystem::remove_all(dir);
     std::cout << (passed ? "all checks passed\n" : "checks failed\n");

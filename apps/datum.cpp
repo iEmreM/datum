@@ -1,4 +1,6 @@
+#include <cmath>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -20,13 +22,15 @@ void print_usage() {
                  "\n"
                  "usage:\n"
                  "  datum info     -i <image>\n"
-                 "  datum capacity -i <image> [--mode binary|raw]\n"
-                 "  datum embed    -i <cover> -o <stego.png> -d <payload> [--mode binary|raw]\n"
-                 "  datum extract  -i <stego.png> -o <payload> [--mode binary|raw]\n"
+                 "  datum capacity -i <image> [--mode binary|raw|lsb] [--bits 1..4]\n"
+                 "  datum embed    -i <cover> -o <stego.png> -d <payload>"
+                 " [--mode binary|raw|lsb] [--bits 1..4]\n"
+                 "  datum extract  -i <stego.png> -o <payload> [--mode binary|raw|lsb]\n"
                  "\n"
                  "notes:\n"
+                 "  --bits sets the low bits per channel used by lsb (default 1)\n"
                  "  output must be .png — lossy formats would erase the payload\n"
-                 "  extract auto-detects the mode unless --mode is given\n";
+                 "  extract auto-detects the mode and bit depth unless --mode is given\n";
 }
 
 Flags parse_flags(int argc, char** argv, int first) {
@@ -70,6 +74,23 @@ datum::Mode require_mode(const Flags& flags, datum::Mode fallback) {
     return *mode;
 }
 
+/// The per-mode parameter carried in the header. Only lsb uses it (k, the number
+/// of low bits per channel); other modes reject --bits so a typo is not ignored.
+uint8_t require_param(const Flags& flags, datum::Mode mode) {
+    const std::string* bits = find_flag(flags, "bits");
+    if (mode != datum::Mode::Lsb) {
+        if (bits != nullptr) {
+            throw std::runtime_error("--bits only applies to --mode lsb");
+        }
+        return 0;
+    }
+    const int k = bits == nullptr ? 1 : std::stoi(*bits);
+    if (k < 1 || k > 4) {
+        throw std::runtime_error("--bits must be between 1 and 4");
+    }
+    return static_cast<uint8_t>(k);
+}
+
 // ponytail: argv is ANSI on Windows, so non-ASCII paths mangle here even though the
 // image and io layers are wide-path clean. Switch to wmain/GetCommandLineW if it bites.
 
@@ -84,7 +105,8 @@ int run_info(const Flags& flags) {
 int run_capacity(const Flags& flags) {
     const datum::Image image = datum::load(require(flags, "i"));
     const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
-    const auto codec = datum::make_codec(mode, 0);
+    const uint8_t param = require_param(flags, mode);
+    const auto codec = datum::make_codec(mode, param);
 
     const std::size_t total = codec->capacity(image);
     const std::size_t payload = total > datum::kHeaderSize ? total - datum::kHeaderSize : 0;
@@ -95,14 +117,22 @@ int run_capacity(const Flags& flags) {
 
 int run_embed(const Flags& flags) {
     datum::Image image = datum::load(require(flags, "i"));
+    const datum::Image cover = image;  // kept only to measure the distortion below
     const std::vector<uint8_t> payload = datum::read_bytes(require(flags, "d"));
     const datum::Mode mode = require_mode(flags, datum::Mode::Raw);
+    const uint8_t param = require_param(flags, mode);
 
-    datum::embed_payload(image, mode, 0, payload);
+    datum::embed_payload(image, mode, param, payload);
     datum::save_png(require(flags, "o"), image);
 
-    std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode)
-              << " mode\n";
+    std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode) << " mode";
+    const double db = datum::psnr(cover, image);
+    if (std::isinf(db)) {
+        std::cout << " (image unchanged)";
+    } else {
+        std::cout << ", PSNR " << std::fixed << std::setprecision(2) << db << " dB";
+    }
+    std::cout << "\n";
     return 0;
 }
 

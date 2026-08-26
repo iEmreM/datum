@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -81,6 +82,27 @@ void save_png(const std::filesystem::path& file, const Image& image) {
         throw std::runtime_error("cannot encode " + file.string() + " as PNG");
     }
     write_bytes(file, encoded);
+}
+
+double psnr(const Image& a, const Image& b) {
+    if (a.pixels.size() != b.pixels.size()) {
+        throw std::runtime_error("psnr: images differ in size");
+    }
+    if (a.pixels.empty()) {
+        throw std::runtime_error("psnr: empty image");
+    }
+
+    double sum_squared_error = 0.0;
+    for (std::size_t i = 0; i < a.pixels.size(); ++i) {
+        const double diff = static_cast<double>(a.pixels[i]) - static_cast<double>(b.pixels[i]);
+        sum_squared_error += diff * diff;
+    }
+    if (sum_squared_error == 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double mse = sum_squared_error / static_cast<double>(a.pixels.size());
+    return 10.0 * std::log10(255.0 * 255.0 / mse);
 }
 
 }  // namespace datum

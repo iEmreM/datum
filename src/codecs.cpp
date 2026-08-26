@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "datum/codec.hpp"
@@ -39,6 +40,65 @@ class BinaryCodec final : public Codec {
             sink.write(image.pixels[sample_index(image, pixel, 0)] >= 128);
         }
     }
+};
+
+/// L2: replace the low k bits of every colour channel with k payload bits. At
+/// k = 1 a channel moves by at most 1 (PSNR ≈ 51 dB), which is below the threshold
+/// of human vision; higher k buys capacity at the cost of visibility. k is stored
+/// in the header, so extraction recovers it without being told.
+class LsbCodec final : public Codec {
+  public:
+    explicit LsbCodec(int k) : k_(k) {
+        if (k < 1 || k > 8) {
+            throw std::runtime_error("lsb bits must be between 1 and 8");
+        }
+    }
+
+    std::size_t capacity(const Image& image) const override {
+        return image.pixel_count() * static_cast<std::size_t>(image.color_channels()) *
+               static_cast<std::size_t>(k_) / 8;
+    }
+
+    void embed(Image& image, BitReader& source) const override {
+        const int colors = image.color_channels();
+        const auto keep = static_cast<uint8_t>(~((1u << k_) - 1u));  // high bits kept as-is
+        for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
+            for (int channel = 0; channel < colors; ++channel) {
+                if (source.exhausted()) {
+                    return;
+                }
+                int taken = 0;
+                uint8_t low = 0;
+                for (; taken < k_ && !source.exhausted(); ++taken) {
+                    low = static_cast<uint8_t>(low << 1 | (source.read() ? 1u : 0u));
+                }
+                // A final partial group (only with k = 3, when 8·bytes ∤ k) is
+                // left-aligned so extraction reads its real bits before the padding.
+                low = static_cast<uint8_t>(low << (k_ - taken));
+                uint8_t& sample = image.pixels[sample_index(image, pixel, channel)];
+                sample = static_cast<uint8_t>((sample & keep) | low);
+            }
+        }
+    }
+
+    void extract(const Image& image, BitWriter& sink, std::size_t bits) const override {
+        const int colors = image.color_channels();
+        const auto mask = static_cast<uint8_t>((1u << k_) - 1u);
+        for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
+            for (int channel = 0; channel < colors; ++channel) {
+                const uint8_t low = image.pixels[sample_index(image, pixel, channel)] & mask;
+                for (int bit = k_ - 1; bit >= 0; --bit) {
+                    if (sink.size() >= bits) {
+                        return;
+                    }
+                    sink.write(((low >> bit) & 1u) != 0);
+                }
+            }
+        }
+    }
+
+  private:
+    int k_;
 };
 
 /// L1: every colour channel byte is one payload byte. Maximum capacity, and the
@@ -84,13 +144,13 @@ class RawCodec final : public Codec {
 }  // namespace
 
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
-    (void)param;  // used from Phase 2 onward (lsb: k, qim: delta)
     switch (mode) {
         case Mode::Binary:
             return std::make_unique<BinaryCodec>();
         case Mode::Raw:
             return std::make_unique<RawCodec>();
         case Mode::Lsb:
+            return std::make_unique<LsbCodec>(param);
         case Mode::Qim:
         case Mode::Dct:
             break;
@@ -98,12 +158,18 @@ std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
     throw std::runtime_error("mode " + std::string(mode_name(mode)) + " is not implemented yet");
 }
 
-std::span<const Mode> detectable_modes() {
-    static constexpr Mode kModes[] = {Mode::Binary, Mode::Raw};
-    return kModes;
-}
-
 namespace {
+
+/// (mode, param) pairs `extract` tries when no mode is forced, cheapest first. lsb
+/// records its k in the header, so every k is a distinct guess: a header parsed at
+/// the wrong k fails the `param == k` self-consistency check below.
+std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
+    std::vector<std::pair<Mode, uint8_t>> candidates = {{Mode::Binary, 0}, {Mode::Raw, 0}};
+    for (uint8_t k = 1; k <= 4; ++k) {
+        candidates.emplace_back(Mode::Lsb, k);
+    }
+    return candidates;
+}
 
 /// Reads back a header with the given codec. Returns nullopt when there is none,
 /// which is also what a wrong mode guess looks like.
@@ -145,19 +211,21 @@ Extracted extract_payload(const Image& image, std::optional<Mode> mode) {
     std::unique_ptr<Codec> codec;
     std::optional<Header> header;
 
-    if (mode) {
-        codec = make_codec(*mode, 0);
-        header = peek_header(image, *codec);
-    } else {
-        for (const Mode candidate : detectable_modes()) {
-            auto attempt = make_codec(candidate, 0);
-            // The mode byte must agree with the codec that read it, otherwise a
-            // chance match on the magic would be accepted as a payload.
-            if (auto found = peek_header(image, *attempt); found && found->mode == candidate) {
-                codec = std::move(attempt);
-                header = found;
-                break;
-            }
+    // Both forcing a mode and auto-detecting reduce to the same scan: a forced mode
+    // just filters the candidate list. The parameter (lsb: k) is always recovered
+    // from the header, never taken from the caller — the CLI cannot know it.
+    for (const auto& [candidate, param] : detection_candidates()) {
+        if (mode && *mode != candidate) {
+            continue;
+        }
+        auto attempt = make_codec(candidate, param);
+        // The header must agree with the codec that read it — same mode, same
+        // parameter — or a chance match on the magic would be taken as a payload.
+        if (auto found = peek_header(image, *attempt);
+            found && found->mode == candidate && found->param == param) {
+            codec = std::move(attempt);
+            header = found;
+            break;
         }
     }
 
