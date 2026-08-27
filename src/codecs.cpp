@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -8,6 +11,7 @@
 #include <vector>
 
 #include "datum/codec.hpp"
+#include "datum/ecc.hpp"
 
 namespace datum {
 namespace {
@@ -341,7 +345,311 @@ class QimCodec final : public Codec {
     int delta_;
 };
 
+/// Orthonormal 8-point DCT-II matrix: M[u][x] = C(u)·cos((2x+1)·u·pi/16).
+///
+/// Applying it as M·f·M^T is exactly JPEG's forward transform, scale factors
+/// included, so a margin measured here is directly comparable to an entry in a
+/// quantisation table. That is the only reason the numbers in docs/DCT.md can be
+/// read against the tables a JPEG encoder actually uses.
+const std::array<double, kDctBlock * kDctBlock>& dct_matrix() {
+    static const std::array<double, kDctBlock * kDctBlock> matrix = [] {
+        std::array<double, kDctBlock * kDctBlock> built{};
+        for (int u = 0; u < kDctBlock; ++u) {
+            const double scale = std::sqrt((u == 0 ? 1.0 : 2.0) / static_cast<double>(kDctBlock));
+            for (int x = 0; x < kDctBlock; ++x) {
+                built[static_cast<std::size_t>(u * kDctBlock + x)] =
+                    scale * std::cos((2 * x + 1) * u * std::numbers::pi / (2.0 * kDctBlock));
+            }
+        }
+        return built;
+    }();
+    return matrix;
+}
+
+using Block = std::array<double, kDctBlock * kDctBlock>;
+
+/// F = M·f·M^T, as two passes of eight-point transforms rather than one 64x64
+/// matrix — same result, an eighth of the multiplications.
+Block forward_dct(const Block& samples) {
+    const auto& m = dct_matrix();
+    Block columns{};
+    for (int u = 0; u < kDctBlock; ++u) {
+        for (int x = 0; x < kDctBlock; ++x) {
+            double sum = 0.0;
+            for (int y = 0; y < kDctBlock; ++y) {
+                sum += m[static_cast<std::size_t>(u * kDctBlock + y)] *
+                       samples[static_cast<std::size_t>(y * kDctBlock + x)];
+            }
+            columns[static_cast<std::size_t>(u * kDctBlock + x)] = sum;
+        }
+    }
+    Block result{};
+    for (int u = 0; u < kDctBlock; ++u) {
+        for (int v = 0; v < kDctBlock; ++v) {
+            double sum = 0.0;
+            for (int x = 0; x < kDctBlock; ++x) {
+                sum += columns[static_cast<std::size_t>(u * kDctBlock + x)] *
+                       m[static_cast<std::size_t>(v * kDctBlock + x)];
+            }
+            result[static_cast<std::size_t>(u * kDctBlock + v)] = sum;
+        }
+    }
+    return result;
+}
+
+/// f = M^T·F·M, the exact inverse of the above.
+Block inverse_dct(const Block& coefficients) {
+    const auto& m = dct_matrix();
+    Block columns{};
+    for (int y = 0; y < kDctBlock; ++y) {
+        for (int v = 0; v < kDctBlock; ++v) {
+            double sum = 0.0;
+            for (int u = 0; u < kDctBlock; ++u) {
+                sum += m[static_cast<std::size_t>(u * kDctBlock + y)] *
+                       coefficients[static_cast<std::size_t>(u * kDctBlock + v)];
+            }
+            columns[static_cast<std::size_t>(y * kDctBlock + v)] = sum;
+        }
+    }
+    Block result{};
+    for (int y = 0; y < kDctBlock; ++y) {
+        for (int x = 0; x < kDctBlock; ++x) {
+            double sum = 0.0;
+            for (int v = 0; v < kDctBlock; ++v) {
+                sum += columns[static_cast<std::size_t>(y * kDctBlock + v)] *
+                       m[static_cast<std::size_t>(v * kDctBlock + x)];
+            }
+            result[static_cast<std::size_t>(y * kDctBlock + x)] = sum;
+        }
+    }
+    return result;
+}
+
+/// The two mid-frequency coefficients whose relation carries the bit — the classic
+/// Zhao-Koch pair. JPEG's standard luma quantisation table gives (4,1) and (3,2)
+/// the same step of 22, which is the point: a re-encode damages both equally, so
+/// the *difference* between them survives what either one alone does not.
+///
+/// Lower frequencies carry the visible structure of the block and cannot be moved
+/// without it showing; higher ones are the first thing any encoder quantises to
+/// zero, which takes the bit with them.
+constexpr std::size_t kCoefficientA = 4 * kDctBlock + 1;
+constexpr std::size_t kCoefficientB = 3 * kDctBlock + 2;
+
+/// The single coefficient at (u, v), without transforming the other 63.
+double coefficient(const Block& samples, std::size_t u, std::size_t v) {
+    const auto& m = dct_matrix();
+    double sum = 0.0;
+    for (std::size_t y = 0; y < kDctBlock; ++y) {
+        double row = 0.0;
+        for (std::size_t x = 0; x < kDctBlock; ++x) {
+            row += samples[y * kDctBlock + x] * m[v * kDctBlock + x];
+        }
+        sum += row * m[u * kDctBlock + y];
+    }
+    return sum;
+}
+
+/// L6: one bit per 8x8 block of luma, carried by which of two mid-frequency DCT
+/// coefficients is the larger.
+///
+/// This is the mode that stops depending on the pixel grid. `qim` reads a bit out
+/// of one pixel's value, so averaging that pixel with its neighbours — which is all
+/// a rescale is — destroys it. A DCT coefficient *is* an average over the whole
+/// block, weighted by a cosine, so resampling the block perturbs it instead of
+/// replacing it. The bit is a comparison between two of them, which cancels
+/// anything that scales both: a global brightness change, a contrast curve, a
+/// quantiser that treats neighbouring frequencies alike.
+///
+/// `margin` is the robustness dial, in the same units as a JPEG quantisation step.
+/// The pair is pushed apart until it is at least that far, which costs a
+/// high-frequency ripple across the block — visually far cheaper than the banding
+/// `qim` pays, because the eye is least sensitive exactly where the change lands.
+///
+/// ponytail: the block lattice is read at the phase it was written at, so a crop, a
+/// letterbox or a carrier that arrives at a different size has to be put back on its
+/// original grid by hand first. Measured, the lattice moving is not what hurts — see
+/// docs/DCT.md — and searching for it needs no format change when it is wanted: the
+/// DTM1 magic inside its own Reed-Solomon codeword is already a sync word, so the
+/// decoder can try offsets until the header decodes.
+class DctCodec final : public Codec {
+  public:
+    explicit DctCodec(int margin) : margin_(margin) {
+        if (margin < kLeastMargin || margin > kMostMargin) {
+            throw std::runtime_error("dct margin must be between " + std::to_string(kLeastMargin) +
+                                     " and " + std::to_string(kMostMargin));
+        }
+    }
+
+    /// Whole blocks only: a ragged strip at the right or bottom edge is left alone,
+    /// the same way the SSIM windows treat it.
+    std::size_t capacity(const Image& image) const override {
+        return blocks_across(image) * blocks_down(image) / 8;
+    }
+
+    void embed(Image& image, BitReader& source) const override {
+        const std::size_t across = blocks_across(image);
+        const std::size_t down = blocks_down(image);
+        for (std::size_t by = 0; by < down && !source.exhausted(); ++by) {
+            for (std::size_t bx = 0; bx < across && !source.exhausted(); ++bx) {
+                carry_block(image, bx, by, source.read());
+            }
+        }
+    }
+
+    void extract(const Image& image, BitWriter& sink, std::size_t bits) const override {
+        const std::size_t across = blocks_across(image);
+        const std::size_t down = blocks_down(image);
+        for (std::size_t by = 0; by < down; ++by) {
+            for (std::size_t bx = 0; bx < across; ++bx) {
+                if (sink.size() >= bits) {
+                    return;
+                }
+                const Block samples = read_block(image, bx, by);
+                sink.write(
+                    coefficient(samples, kCoefficientA / kDctBlock, kCoefficientA % kDctBlock) >
+                    coefficient(samples, kCoefficientB / kDctBlock, kCoefficientB % kDctBlock));
+            }
+        }
+    }
+
+  private:
+    static std::size_t blocks_across(const Image& image) {
+        return static_cast<std::size_t>(image.width / kDctBlock);
+    }
+
+    static std::size_t blocks_down(const Image& image) {
+        return static_cast<std::size_t>(image.height / kDctBlock);
+    }
+
+    static std::size_t pixel_at(const Image& image, std::size_t bx, std::size_t by, int i) {
+        const std::size_t x = bx * kDctBlock + static_cast<std::size_t>(i % kDctBlock);
+        const std::size_t y = by * kDctBlock + static_cast<std::size_t>(i / kDctBlock);
+        return y * static_cast<std::size_t>(image.width) + x;
+    }
+
+    static Block read_block(const Image& image, std::size_t bx, std::size_t by) {
+        Block samples{};
+        for (int i = 0; i < kDctBlock * kDctBlock; ++i) {
+            samples[static_cast<std::size_t>(i)] = luma(image, pixel_at(image, bx, by, i));
+        }
+        return samples;
+    }
+
+    /// Moves a whole pixel by `by`, every colour channel together — the same trick
+    /// `qim` uses, and for the same reason: the channel differences are the colour,
+    /// 4:2:0 stores them at quarter resolution, and leaving them untouched is what
+    /// keeps chroma subsampling from having anything of ours to average away.
+    static void shift_pixel(Image& image, std::size_t pixel, int by) {
+        const std::size_t at = pixel * static_cast<std::size_t>(image.channels);
+        for (int channel = 0; channel < image.color_channels(); ++channel) {
+            uint8_t& sample = image.pixels[at + static_cast<std::size_t>(channel)];
+            sample = static_cast<uint8_t>(std::clamp(sample + by, 0, 255));
+        }
+    }
+
+    /// Pushes one block's coefficient pair apart until the bit reads back.
+    ///
+    /// The retry loop is the part that is not optional. Between asking for a
+    /// coefficient change and getting one, the block is rounded back to whole
+    /// numbers and clamped into 0..255, and a block already near black or white
+    /// loses most of the push to the clamp. Rather than assume the write landed,
+    /// each pass re-reads what the image now actually holds and asks for more if
+    /// the relation is still short. A block that is still wrong after the last
+    /// pass is left to Reed-Solomon, which is why the stream has parity.
+    void carry_block(Image& image, std::size_t bx, std::size_t by, bool bit) const {
+        // ponytail: a full forward and inverse transform per attempt, re-read from
+        // the image each pass. Only two of the 64 coefficients are ever looked at
+        // and only two ever changed, so a pass could be a rank-2 update instead.
+        // Phase 7 is where that gets profiled; embedding is on nobody's hot path yet.
+        constexpr int kAttempts = 4;
+        for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+            const Block samples = read_block(image, bx, by);
+            Block coefficients = forward_dct(samples);
+            const double want = margin_ * attempt;
+            const double gap = coefficients[kCoefficientA] - coefficients[kCoefficientB];
+            if (bit ? gap >= want : gap <= -want) {
+                return;
+            }
+
+            // Both coefficients move by half the shortfall, in opposite directions:
+            // the block's other 62 coefficients — its actual picture — stay exactly
+            // as they were, and the change is spread symmetrically across the pair.
+            const double shift = ((bit ? want : -want) - gap) / 2.0;
+            coefficients[kCoefficientA] += shift;
+            coefficients[kCoefficientB] -= shift;
+
+            const Block updated = inverse_dct(coefficients);
+            for (int i = 0; i < kDctBlock * kDctBlock; ++i) {
+                const auto index = static_cast<std::size_t>(i);
+                const int target =
+                    std::clamp(static_cast<int>(std::lround(updated[index])), 0, 255);
+                shift_pixel(image,
+                            pixel_at(image, bx, by, i),
+                            target - static_cast<int>(std::lround(samples[index])));
+            }
+        }
+    }
+
+    int margin_;
+};
+
 }  // namespace
+
+bool uses_ecc(Mode mode) {
+    return mode == Mode::Dct;
+}
+
+/// Bytes the header occupies in the stream: 16 plain, 48 with parity.
+std::size_t header_block_size(Mode mode) {
+    return uses_ecc(mode) ? ecc_encoded_size(kHeaderSize) : kHeaderSize;
+}
+
+Header make_header(Mode mode, uint8_t param, std::span<const uint8_t> payload) {
+    Header header;
+    header.mode = mode;
+    header.param = param;
+    header.flags = uses_ecc(mode) ? kFlagEcc : 0u;
+    header.payload_len = static_cast<uint32_t>(payload.size());
+    header.payload_crc = crc32(payload);
+    return header;
+}
+
+std::size_t stream_size(Mode mode, std::size_t payload_len) {
+    return header_block_size(mode) + (uses_ecc(mode) ? ecc_encoded_size(payload_len) : payload_len);
+}
+
+std::size_t payload_capacity(Mode mode, std::size_t carrier_bytes) {
+    const std::size_t header = header_block_size(mode);
+    if (carrier_bytes <= header) {
+        return 0;
+    }
+    const std::size_t room = carrier_bytes - header;
+    if (!uses_ecc(mode)) {
+        return room;
+    }
+    // Whole RS blocks first, then whatever a final short block can still carry —
+    // it keeps all 32 parity bytes however little data it holds.
+    const std::size_t whole = room / (kEccData + kEccParity);
+    const std::size_t rest = room % (kEccData + kEccParity);
+    return whole * kEccData + (rest > kEccParity ? rest - kEccParity : 0);
+}
+
+std::vector<uint8_t> build_stream(const Header& header, std::span<const uint8_t> payload) {
+    const std::vector<uint8_t> serialized = serialize(header);
+    if (!uses_ecc(header.mode)) {
+        std::vector<uint8_t> stream = serialized;
+        stream.insert(stream.end(), payload.begin(), payload.end());
+        return stream;
+    }
+    // Two separate codewords, not one: extraction has to read and trust the header
+    // before it knows how long the payload behind it is, so the header's parity has
+    // to stand on its own.
+    std::vector<uint8_t> stream = ecc_encode(serialized);
+    const std::vector<uint8_t> coded = ecc_encode(payload);
+    stream.insert(stream.end(), coded.begin(), coded.end());
+    return stream;
+}
 
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
     switch (mode) {
@@ -356,7 +664,7 @@ std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
         case Mode::Qim:
             return std::make_unique<QimCodec>(param);
         case Mode::Dct:
-            break;
+            return std::make_unique<DctCodec>(param);
     }
     throw std::runtime_error("mode " + std::string(mode_name(mode)) + " is not implemented yet");
 }
@@ -366,6 +674,12 @@ namespace {
 /// (mode, param) pairs to try when no mode is forced, cheapest first. lsb records
 /// its k in the header, so every k is a distinct guess: a header parsed at the
 /// wrong k fails the `param == k` self-consistency check in detect_codec.
+///
+/// `dct` is the one mode with a single entry however wide its parameter range is:
+/// the margin only says how hard the *embedder* pushed the two coefficients apart,
+/// and reading them back is a comparison that does not care. Every margin would
+/// return the same bits, so one probe finds the header and the margin comes out of
+/// it — see detect_codec.
 std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
     std::vector<std::pair<Mode, uint8_t>> candidates = {{Mode::Binary, 0}, {Mode::Raw, 0}};
     for (uint8_t k = 1; k <= 8; ++k) {
@@ -377,18 +691,38 @@ std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
     for (auto delta = static_cast<uint8_t>(kLeastDelta); delta <= kMostDelta; ++delta) {
         candidates.emplace_back(Mode::Qim, delta);
     }
+    candidates.emplace_back(Mode::Dct, static_cast<uint8_t>(kDefaultMargin));
     return candidates;
 }
 
-/// Reads back a header with the given codec. Returns nullopt when there is none,
-/// which is also what a wrong mode guess looks like.
-std::optional<Header> peek_header(const Image& image, const Codec& codec) {
-    if (codec.capacity(image) < kHeaderSize) {
+/// Reads back a header with the given codec, undoing its parity if the mode uses
+/// any. Returns nullopt when there is none, which is also what a wrong mode guess
+/// looks like.
+std::optional<Header> peek_header(const Image& image, const Codec& codec, Mode mode) {
+    const std::size_t block = header_block_size(mode);
+    if (codec.capacity(image) < block) {
         return std::nullopt;
     }
     BitWriter sink;
-    codec.extract(image, sink, kHeaderSize * 8);
-    return parse_header(sink.bytes());
+    codec.extract(image, sink, block * 8);
+    if (!uses_ecc(mode)) {
+        return parse_header(sink.bytes());
+    }
+    const std::optional<std::vector<uint8_t>> corrected = ecc_decode(sink.bytes(), kHeaderSize);
+    return corrected ? parse_header(*corrected) : std::nullopt;
+}
+
+/// True when a header describes the codec that read it. A chance match on the magic
+/// is otherwise taken as a payload, and the parity flag has to agree too — it says
+/// how the bytes behind the header are framed.
+bool agrees(const Header& header, Mode mode, uint8_t param) {
+    if (header.mode != mode || ((header.flags & kFlagEcc) != 0) != uses_ecc(mode)) {
+        return false;
+    }
+    if (mode != Mode::Dct) {
+        return header.param == param;
+    }
+    return header.param >= kLeastMargin && header.param <= kMostMargin;
 }
 
 }  // namespace
@@ -399,26 +733,43 @@ std::optional<Detected> detect_codec(const Image& carrier, std::optional<Mode> f
             continue;
         }
         auto attempt = make_codec(candidate, param);
-        // The header must agree with the codec that read it — same mode, same
-        // parameter — or a chance match on the magic would be taken as a payload.
-        if (auto found = peek_header(carrier, *attempt);
-            found && found->mode == candidate && found->param == param) {
-            return Detected{std::move(attempt), *found};
+        const std::optional<Header> found = peek_header(carrier, *attempt, candidate);
+        if (!found || !agrees(*found, candidate, param)) {
+            continue;
         }
+        // dct's probe used a placeholder margin; the header names the real one, and
+        // rebuilding with it keeps `Detected` honest about what wrote the carrier.
+        if (candidate == Mode::Dct && found->param != param) {
+            attempt = make_codec(candidate, found->param);
+        }
+        return Detected{std::move(attempt), *found};
     }
     return std::nullopt;
 }
 
 Extracted verify_payload(const Header& header, std::span<const uint8_t> stream) {
-    if (stream.size() < kHeaderSize + header.payload_len) {
+    const std::size_t needed = stream_size(header.mode, header.payload_len);
+    if (stream.size() < needed) {
         throw std::runtime_error("payload is shorter than its header claims");
     }
 
+    const std::size_t start = header_block_size(header.mode);
+    const std::span<const uint8_t> body(stream.data() + start, needed - start);
+
     Extracted result;
     result.header = header;
-    result.payload.assign(stream.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
-                          stream.begin() + static_cast<std::ptrdiff_t>(kHeaderSize) +
-                              static_cast<std::ptrdiff_t>(header.payload_len));
+    if (uses_ecc(header.mode)) {
+        std::optional<std::vector<uint8_t>> corrected = ecc_decode(body, header.payload_len);
+        if (!corrected) {
+            throw std::runtime_error(
+                "the payload has more errors than Reed-Solomon can correct (more than "
+                "16 wrong bytes in a 255-byte block)");
+        }
+        result.payload = std::move(*corrected);
+    } else {
+        result.payload.assign(body.begin(),
+                              body.begin() + static_cast<std::ptrdiff_t>(header.payload_len));
+    }
 
     if (crc32(result.payload) != header.payload_crc) {
         throw std::runtime_error(
@@ -430,7 +781,7 @@ Extracted verify_payload(const Header& header, std::span<const uint8_t> stream) 
 
 void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8_t> payload) {
     const auto codec = make_codec(mode, param);
-    const std::size_t needed = kHeaderSize + payload.size();
+    const std::size_t needed = stream_size(mode, payload.size());
     const std::size_t available = codec->capacity(image);
     if (needed > available) {
         throw std::runtime_error("payload needs " + std::to_string(needed) + " bytes but " +
@@ -438,15 +789,7 @@ void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8
                                  std::to_string(available));
     }
 
-    Header header;
-    header.mode = mode;
-    header.param = param;
-    header.payload_len = static_cast<uint32_t>(payload.size());
-    header.payload_crc = crc32(payload);
-
-    std::vector<uint8_t> stream = serialize(header);
-    stream.insert(stream.end(), payload.begin(), payload.end());
-
+    const std::vector<uint8_t> stream = build_stream(make_header(mode, param, payload), payload);
     BitReader source(stream);
     codec->embed(image, source);
 }
@@ -457,7 +800,7 @@ Extracted extract_payload(const Image& image, std::optional<Mode> mode) {
         throw std::runtime_error("no datum payload found (or the wrong mode was given)");
     }
 
-    const std::size_t needed = kHeaderSize + found->header.payload_len;
+    const std::size_t needed = stream_size(found->header.mode, found->header.payload_len);
     if (needed > found->codec->capacity(image)) {
         throw std::runtime_error("header claims " + std::to_string(found->header.payload_len) +
                                  " payload bytes, more than this image can hold");

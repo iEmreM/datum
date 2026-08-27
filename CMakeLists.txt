@@ -25,6 +25,7 @@ add_library(datum_core
     src/analyze.cpp
     src/codecs.cpp
     src/container.cpp
+    src/ecc.cpp
     src/image.cpp
     src/io.cpp
     src/video.cpp

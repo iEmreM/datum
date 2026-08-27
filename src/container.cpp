@@ -81,6 +81,15 @@ std::optional<Header> parse_header(std::span<const uint8_t> bytes) {
     return header;
 }
 
+int header_repeat(const Header& header) {
+    return (header.flags >> 3) + 1;
+}
+
+void set_header_repeat(Header& header, int repeat) {
+    header.flags =
+        static_cast<uint8_t>((header.flags & 0x07u) | ((static_cast<unsigned>(repeat) - 1u) << 3));
+}
+
 std::string_view mode_name(Mode mode) {
     switch (mode) {
         case Mode::Binary:

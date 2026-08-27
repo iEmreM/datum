@@ -39,12 +39,48 @@ inline constexpr int kLeastDelta = 2;
 inline constexpr int kMostDelta = 32;
 inline constexpr int kDefaultDelta = 28;
 
+/// The separation `dct` forces between its two coefficients, in the same units a
+/// JPEG quantisation step is measured in, and the default docs/DCT.md settled on.
+/// Below the smallest the relation does not survive being rounded back to whole
+/// pixels; above the largest the block is visibly textured.
+inline constexpr int kLeastMargin = 2;
+inline constexpr int kMostMargin = 64;
+inline constexpr int kDefaultMargin = 32;
+
+/// The side of a `dct` block, in pixels. One bit rides on each.
+inline constexpr int kDctBlock = 8;
+
 /// Throws std::runtime_error for modes that are not implemented yet.
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param);
+
+/// True when this mode's stream is Reed-Solomon coded. Only `dct` is, and that is
+/// the whole difference between the two families of mode here: every other one
+/// either reaches the decoder perfectly or not at all, so parity bytes would only
+/// cost capacity. `dct` is the first whose stream arrives *slightly* wrong, and a
+/// CRC needs every bit of it.
+bool uses_ecc(Mode mode);
+
+/// Bytes the header occupies at the front of the stream: 16 plain, 48 with parity.
+/// Extraction has to read exactly this much before it knows anything else.
+std::size_t header_block_size(Mode mode);
+
+/// Bytes of carrier the stream for a payload of this length occupies: the header
+/// block, then the payload block, each with parity when the mode asks for it.
+std::size_t stream_size(Mode mode, std::size_t payload_len);
+
+/// The header describing this payload — length, CRC and the flags the mode implies.
+Header make_header(Mode mode, uint8_t param, std::span<const uint8_t> payload);
+
+/// The inverse: the largest payload `carrier_bytes` of raw capacity can hold.
+std::size_t payload_capacity(Mode mode, std::size_t carrier_bytes);
 
 /// Prepends a DTM1 header to `payload` and writes the whole stream into `image`.
 /// Throws std::runtime_error if the payload does not fit.
 void embed_payload(Image& image, Mode mode, uint8_t param, std::span<const uint8_t> payload);
+
+/// The exact bytes a codec is fed for this header and payload. Shared so the image
+/// and video paths cannot drift apart about what a stream looks like.
+std::vector<uint8_t> build_stream(const Header& header, std::span<const uint8_t> payload);
 
 struct Extracted {
     Header header;

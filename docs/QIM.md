@@ -49,21 +49,21 @@ by stb at the stated quality. Cells are BER; **bold** is a clean CRC, i.e. the f
 came back byte for byte. PSNR and SSIM are the cost of embedding, measured against the
 cover before any re-encode.
 
-| delta | PSNR | SSIM | jpeg 95 | jpeg 85 | jpeg 75 | h264 crf18 | h264 crf23 | h264 crf28 | h264 4:4:4 crf23 | half scale |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 47.1 | 0.996 | 0.4184 | 0.4764 | 0.4944 | 0.4962 | 0.4979 | 0.4975 | 0.5018 | 0.4338 |
-| 4 | 41.1 | 0.986 | 0.2020 | 0.3589 | 0.4149 | 0.4263 | 0.4968 | 0.5011 | 0.4955 | 0.3664 |
-| 6 | 37.5 | 0.970 | 0.1192 | 0.3081 | 0.3574 | 0.2942 | 0.4915 | 0.4967 | 0.4834 | 0.3443 |
-| 8 | 35.0 | 0.951 | 0.0474 | 0.2609 | 0.3257 | 0.1972 | 0.4495 | 0.4966 | 0.4553 | 0.3370 |
-| 12 | 31.2 | 0.914 | 0.0040 | 0.1754 | 0.2639 | 0.1066 | 0.3261 | 0.4969 | 0.3297 | 0.3272 |
-| 16 | 28.6 | 0.881 | 0.0001 | 0.1119 | 0.2165 | 0.0471 | 0.2349 | 0.4843 | 0.2385 | 0.3229 |
-| 20 | 26.9 | 0.856 | **0.0000** | 0.0694 | 0.1767 | 0.0163 | 0.1484 | 0.4434 | 0.1702 | 0.3194 |
-| 24 | 25.5 | 0.839 | **0.0000** | 0.0328 | 0.1339 | 0.0065 | 0.1049 | 0.3988 | 0.1347 | 0.3145 |
-| 26 | 24.9 | 0.830 | **0.0000** | 0.0245 | 0.1214 | 0.0030 | 0.0710 | 0.3391 | 0.1071 | 0.3154 |
-| **28** | 23.6 | 0.823 | **0.0000** | 0.0140 | 0.1000 | 0.0023 | 0.0539 | 0.2953 | 0.0820 | 0.3158 |
-| 32 | 23.4 | 0.814 | **0.0000** | 0.0061 | 0.0731 | 0.0003 | 0.0359 | 0.2701 | 0.0547 | 0.3138 |
+| delta | PSNR | SSIM | jpeg 95 | jpeg 85 | jpeg 75 | h264 crf18 | h264 crf23 | h264 crf28 | h264 444 crf23 | vp9 crf32 | vp9 crf40 | h264 24fps | half scale | 3/4 scale |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 47.1 | 0.996 | 0.4184 | 0.4764 | 0.4944 | 0.4962 | 0.4979 | 0.4975 | 0.5018 | 0.4943 | 0.4973 | 0.4859 | 0.4338 | 0.3390 |
+| 4 | 41.1 | 0.986 | 0.2020 | 0.3589 | 0.4149 | 0.4263 | 0.4968 | 0.5011 | 0.4955 | 0.3670 | 0.4902 | 0.3359 | 0.3664 | 0.2409 |
+| 6 | 37.5 | 0.970 | 0.1192 | 0.3081 | 0.3574 | 0.2942 | 0.4915 | 0.4967 | 0.4834 | 0.1860 | 0.4054 | 0.2289 | 0.3443 | 0.2141 |
+| 8 | 35.0 | 0.951 | 0.0474 | 0.2609 | 0.3257 | 0.1972 | 0.4495 | 0.4966 | 0.4553 | 0.0700 | 0.2716 | 0.1528 | 0.3370 | 0.2130 |
+| 12 | 31.2 | 0.914 | 0.0040 | 0.1754 | 0.2639 | 0.1066 | 0.3261 | 0.4969 | 0.3297 | 0.0039 | 0.0909 | 0.0601 | 0.3272 | 0.1996 |
+| 16 | 28.6 | 0.881 | 0.0001 | 0.1119 | 0.2165 | 0.0471 | 0.2349 | 0.4843 | 0.2385 | 0.0003 | 0.0276 | 0.0194 | 0.3229 | 0.1938 |
+| 20 | 26.9 | 0.856 | **0.0000** | 0.0694 | 0.1767 | 0.0163 | 0.1484 | 0.4434 | 0.1702 | **0.0000** | 0.0049 | 0.0050 | 0.3194 | 0.1898 |
+| 24 | 25.5 | 0.839 | **0.0000** | 0.0328 | 0.1339 | 0.0065 | 0.1049 | 0.3988 | 0.1347 | **0.0000** | 0.0009 | 0.0014 | 0.3145 | 0.1847 |
+| 26 | 24.9 | 0.830 | **0.0000** | 0.0245 | 0.1214 | 0.0030 | 0.0710 | 0.3391 | 0.1071 | **0.0000** | 0.0003 | 0.0006 | 0.3154 | 0.1834 |
+| **28** | 23.6 | 0.823 | **0.0000** | 0.0140 | 0.1000 | 0.0023 | 0.0539 | 0.2953 | 0.0820 | **0.0000** | 0.0002 | 0.0004 | 0.3158 | 0.1833 |
+| 32 | 23.4 | 0.814 | **0.0000** | 0.0061 | 0.0731 | 0.0003 | 0.0359 | 0.2701 | 0.0547 | **0.0000** | **0.0000** | 0.0001 | 0.3138 | 0.1801 |
 
-Four things fall out of it.
+Five things fall out of it.
 
 **How full the carrier is barely matters.** The same sweep at 5% and at 100% fill
 moves every BER cell by less than 0.005. A codec damages the region it is given, and
@@ -75,11 +75,21 @@ reads 30.7 dB and 0.966 instead of 23.6 dB and 0.823.
 column is the control — leaving chroma at full resolution changes the 4:2:0 result by
 a few hundredths. For the per-channel carrier it changed everything.
 
-**A rescale is the wall.** The `half scale` column uses a *lossless* codec, so the only
-thing it measures is the resampling — and it sits at 0.31–0.43 for every delta, which
+**A rescale is the wall.** The two scale columns use a *lossless* codec, so the only
+thing they measure is the resampling — and they sit at 0.18–0.43 for every delta, which
 is what guessing scores. Averaging neighbouring pixels replaces a value instead of
 nudging it, and a margin is no defence against a replacement. This is the documented
-limit of every spatial mode, and the reason Phase 6 moves into the DCT domain.
+limit of every spatial mode. [`dct`](DCT.md) is the mode that crosses it: on the same
+cover and the same harness it clears `3/4 scale` from margin 4 and `half scale` from
+margin 12.
+
+**VP9 is gentler than H.264, and the frame rate is not the problem.** VP9 at CRF 32
+comes back clean from `delta = 20`, several steps before any H.264 column — worth
+knowing, because VP9 is what YouTube serves most viewers. The `h264 24fps` row is the
+same encode at a converted frame rate, and it tracks `h264 crf23` closely: converting
+the rate of a still costs almost nothing extra. What a rate conversion really does to a
+*video* is drop frames, which no single-frame harness can measure; that is a video-layer
+question, and `--repeat` is the answer to it (see [`docs/DCT.md`](DCT.md)).
 
 **BER alone does not decide anything.** A CRC needs every bit, so 0.0001 and 0.5 are
 the same verdict. The bold cells are the only rows that mean "the file came back".
@@ -122,14 +132,19 @@ of magnitude better than CRF 23 at the same delta while the margin is identical.
 
 It is not an encoder-tuning problem either. Turning off psychovisual optimisation
 (`-x264-params psy-rd=0:aq-mode=0`) and forcing full-range conversion move the CRF 23
-failure from "no header found" to "CRC mismatch" and no further. Closing the gap needs
-redundancy rather than a bigger step, and that is Phase 6: Reed–Solomon over the
-payload, one bit per block instead of per pixel, and the same bit repeated across
-frames.
+failure from "no header found" to "CRC mismatch" and no further. Closing the gap needed
+redundancy rather than a bigger step, and that is what Phase 6 built: Reed–Solomon over
+the payload, one bit per block instead of per pixel, and the whole payload repeated
+across frames.
 
 The roadmap expected `delta = 16` to clear "moderate JPEG and H.264". Half of that is
 right — high-quality JPEG is comfortable and near-lossless H.264 is reachable at a
 large step; delivery-grade H.264 is not.
+
+Phase 6 did close it, and not with a bigger step: [`dct`](DCT.md) clears CRF 23 at
+margin 20 and CRF 28 at 28, with 8 dB *less* distortion than `qim` pays here. Moving
+the bit off a pixel value and onto a relation between two DCT coefficients is what
+made the difference, with Reed-Solomon mopping up what was left.
 
 ## The visible cost
 
@@ -153,6 +168,7 @@ attacks it runs hunt the LSB *replacement* signature, which `qim` does not produ
 cmake --build build --target datum_robustness
 build/datum_robustness --fill 0.25              # generated cover, no media needed
 build/datum_robustness -i photo.png --fill 0.1
+build/datum_robustness --mode dct --fill 0.25   # the same sweep for docs/DCT.md
 ```
 
 By hand — note that the stego is written as PNG, because `datum` still refuses to

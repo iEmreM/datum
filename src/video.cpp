@@ -198,6 +198,33 @@ std::string find_value(const std::string& text, const std::string& key) {
     return text.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
+/// Folds several readings of the same stream into one, bit by bit. Ties go to
+/// zero, which matters little: a tie needs an even number of copies and whatever
+/// it decides wrong is one more error for Reed-Solomon, not a lost payload.
+std::vector<uint8_t> majority(const std::vector<const std::vector<uint8_t>*>& copies,
+                              std::size_t bytes) {
+    std::vector<uint8_t> voted(bytes, 0);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            std::size_t ones = 0;
+            for (const std::vector<uint8_t>* copy : copies) {
+                ones += ((*copy)[i] >> bit) & 1u;
+            }
+            if (ones * 2 > copies.size()) {
+                voted[i] |= static_cast<uint8_t>(1u << bit);
+            }
+        }
+    }
+    return voted;
+}
+
+void check_repeat(int repeat) {
+    if (repeat < kLeastRepeat || repeat > kMostRepeat) {
+        throw std::runtime_error("repeat must be between " + std::to_string(kLeastRepeat) +
+                                 " and " + std::to_string(kMostRepeat));
+    }
+}
+
 }  // namespace
 
 bool is_video(const std::filesystem::path& file) {
@@ -242,17 +269,26 @@ Image first_frame(const std::filesystem::path& file) {
     return decode_first_frame(file, probe(file));
 }
 
-std::size_t video_capacity(const VideoInfo& info, Mode mode, uint8_t param) {
+std::size_t video_capacity(const VideoInfo& info, Mode mode, uint8_t param, int repeat) {
+    check_repeat(repeat);
     const std::size_t per_frame = make_codec(mode, param)->capacity(frame_shape(info));
-    const std::size_t total = per_frame * info.frames;
-    return total > kHeaderSize ? total - kHeaderSize : 0;
+    // Redundant copies are whole streams in single frames, so capacity is one
+    // frame's worth however many of them there are — what grows with `repeat` is
+    // the number of frames spent, not the size of what fits.
+    if (repeat > 1) {
+        return info.frames >= static_cast<std::size_t>(repeat) ? payload_capacity(mode, per_frame)
+                                                               : 0;
+    }
+    return payload_capacity(mode, per_frame * info.frames);
 }
 
 VideoStats embed_video(const std::filesystem::path& in,
                        const std::filesystem::path& out,
                        Mode mode,
                        uint8_t param,
-                       std::span<const uint8_t> payload) {
+                       std::span<const uint8_t> payload,
+                       int repeat) {
+    check_repeat(repeat);
     if (lowercase(out.extension().string()) != ".mkv") {
         throw std::runtime_error("refusing to write " + out.string() +
                                  ": only .mkv (lossless FFV1) preserves exact pixel values");
@@ -264,26 +300,32 @@ VideoStats embed_video(const std::filesystem::path& in,
 
     // Extraction reads the header from the first frame alone, so it has to fit
     // there. Enforcing it here keeps the decoder side simple.
-    if (per_frame < kHeaderSize) {
+    if (per_frame < header_block_size(mode)) {
         throw std::runtime_error("a " + std::to_string(info.width) + "x" +
                                  std::to_string(info.height) + " frame holds only " +
                                  std::to_string(per_frame) + " bytes in " +
                                  std::string(mode_name(mode)) + " mode, too little for a header");
     }
 
-    Header header;
-    header.mode = mode;
-    header.param = param;
-    header.payload_len = static_cast<uint32_t>(payload.size());
-    header.payload_crc = crc32(payload);
+    Header header = make_header(mode, param, payload);
+    set_header_repeat(header, repeat);
+    const std::vector<uint8_t> stream = build_stream(header, payload);
 
-    std::vector<uint8_t> stream = serialize(header);
-    stream.insert(stream.end(), payload.begin(), payload.end());
+    // A redundant copy is a whole stream inside one frame, so it has to fit in one.
+    if (repeat > 1 && stream.size() > per_frame) {
+        throw std::runtime_error(
+            "a repeated payload must fit in a single frame: " + std::to_string(stream.size()) +
+            " bytes needed, " + std::to_string(per_frame) + " available in " +
+            std::string(mode_name(mode)) + " mode at " + std::to_string(info.width) + "x" +
+            std::to_string(info.height));
+    }
 
     // Only an upfront courtesy — the frame count can be unknown, so the real
-    // guarantee is the exhausted() check after the loop.
-    if (info.frames > 0 && stream.size() > per_frame * info.frames) {
-        throw std::runtime_error("payload needs " + std::to_string(stream.size()) + " bytes but " +
+    // guarantee is the check after the loop.
+    const std::size_t total =
+        repeat > 1 ? stream.size() * static_cast<std::size_t>(repeat) : stream.size();
+    if (info.frames > 0 && total > per_frame * info.frames) {
+        throw std::runtime_error("payload needs " + std::to_string(total) + " bytes but " +
                                  std::to_string(info.frames) + " frames hold only " +
                                  std::to_string(per_frame * info.frames) + " in " +
                                  std::string(mode_name(mode)) + " mode");
@@ -297,18 +339,31 @@ VideoStats embed_video(const std::filesystem::path& in,
     frame.pixels.resize(info.frame_bytes());
     std::vector<uint8_t> before;
 
-    BitReader source(stream);
+    // repeat == 1 spans: one reader feeds frame after frame until the payload runs
+    // out, and a frame only means anything alongside the ones before it. repeat > 1
+    // does the opposite — each of the first `repeat` frames gets the *whole* stream
+    // from a reader of its own, so no frame depends on any other. That is what makes
+    // the copies survive a frame being dropped, blended or re-ordered on the way:
+    // a lost frame costs one vote, not the alignment of everything after it.
+    BitReader spanning(stream);
     VideoStats stats;
     double sum_squared_error = 0.0;
     std::size_t samples = 0;
 
     while (decoder.read_frame(frame.pixels)) {
-        if (!source.exhausted()) {
+        const bool carries =
+            repeat > 1 ? stats.frames < static_cast<std::size_t>(repeat) : !spanning.exhausted();
+        if (carries) {
             // Untouched frames contribute no error, so only the ones we write
             // into need copying — the distortion is still measured over the
             // whole video, exactly as it is for a still image.
             before = frame.pixels;
-            codec->embed(frame, source);
+            if (repeat > 1) {
+                BitReader whole(stream);
+                codec->embed(frame, whole);
+            } else {
+                codec->embed(frame, spanning);
+            }
             ++stats.frames_used;
             for (std::size_t i = 0; i < frame.pixels.size(); ++i) {
                 const double diff =
@@ -327,9 +382,12 @@ VideoStats embed_video(const std::filesystem::path& in,
     if (stats.frames == 0) {
         throw std::runtime_error("no frames decoded from " + in.string());
     }
-    if (!source.exhausted()) {
-        throw std::runtime_error("the video ran out " + std::to_string(source.remaining() / 8) +
-                                 " bytes before the payload was finished");
+    if (repeat > 1 ? stats.frames_used < static_cast<std::size_t>(repeat) : !spanning.exhausted()) {
+        throw std::runtime_error(
+            repeat > 1 ? "the video has only " + std::to_string(stats.frames) +
+                             " frames, too few for " + std::to_string(repeat) + " copies"
+                       : "the video ran out " + std::to_string(spanning.remaining() / 8) +
+                             " bytes before the payload was finished");
     }
 
     stats.psnr = psnr_from_squared_error(sum_squared_error, samples);
@@ -347,25 +405,41 @@ Extracted extract_video(const std::filesystem::path& in, std::optional<Mode> mod
             "no datum payload in the first frame (or the wrong mode was given)");
     }
 
-    const std::size_t needed = (kHeaderSize + found->header.payload_len) * 8;
+    const int repeat = header_repeat(found->header);
+    const std::size_t needed = stream_size(found->header.mode, found->header.payload_len) * 8;
     const std::size_t per_frame = found->codec->capacity(frame) * 8;
     if (per_frame == 0) {
         throw std::runtime_error("frames are too small to carry a payload in this mode");
     }
 
-    // Second pass: exactly the frames the payload spans, rounded up. capacity()
-    // floors to whole bytes, so this can only ever over-ask, never under-ask.
-    Pipe decoder(decode_command(in, (needed + per_frame - 1) / per_frame), datum_read_mode);
-    BitWriter sink;
-    while (sink.size() < needed && decoder.read_frame(frame.pixels)) {
-        found->codec->extract(frame, sink, needed);
+    // Second pass: exactly the frames the payload occupies. Spanning needs as many
+    // as the stream reaches into, rounded up — capacity() floors to whole bytes, so
+    // this can only over-ask. Repeated needs one per copy.
+    const std::size_t wanted =
+        repeat > 1 ? static_cast<std::size_t>(repeat) : (needed + per_frame - 1) / per_frame;
+    Pipe decoder(decode_command(in, wanted), datum_read_mode);
+
+    std::vector<BitWriter> copies(static_cast<std::size_t>(repeat));
+    for (std::size_t read = 0; read < wanted && decoder.read_frame(frame.pixels); ++read) {
+        // Spanning writes every frame into the one sink, which is what carries a
+        // payload across frames; repeated gives each frame a sink of its own.
+        found->codec->extract(frame, copies[repeat > 1 ? read : 0], needed);
     }
     decoder.close_or_throw("reading the video");
 
-    if (sink.size() < needed) {
+    // A copy that did not fill up is a frame the video did not have. Voting on the
+    // ones that did is better than refusing outright, and it is exactly the case
+    // repetition exists for.
+    std::vector<const std::vector<uint8_t>*> complete;
+    for (const BitWriter& copy : copies) {
+        if (copy.size() >= needed) {
+            complete.push_back(&copy.bytes());
+        }
+    }
+    if (complete.empty()) {
         throw std::runtime_error("the video ended before the payload was complete");
     }
-    return verify_payload(found->header, sink.bytes());
+    return verify_payload(found->header, majority(complete, needed / 8));
 }
 
 }  // namespace datum

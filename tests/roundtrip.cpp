@@ -21,6 +21,7 @@
 #include "datum/bitstream.hpp"
 #include "datum/codec.hpp"
 #include "datum/container.hpp"
+#include "datum/ecc.hpp"
 #include "datum/image.hpp"
 #include "datum/io.hpp"
 #include "datum/video.hpp"
@@ -441,15 +442,7 @@ datum::Image halve_and_back(datum::Image image) {
 std::vector<uint8_t> embedded_stream(datum::Mode mode,
                                      uint8_t param,
                                      const std::vector<uint8_t>& payload) {
-    datum::Header header;
-    header.mode = mode;
-    header.param = param;
-    header.payload_len = static_cast<uint32_t>(payload.size());
-    header.payload_crc = datum::crc32(payload);
-
-    std::vector<uint8_t> stream = datum::serialize(header);
-    stream.insert(stream.end(), payload.begin(), payload.end());
-    return stream;
+    return datum::build_stream(datum::make_header(mode, param, payload), payload);
 }
 
 bool test_qim_roundtrip(const std::filesystem::path& dir) {
@@ -670,6 +663,197 @@ bool test_detects_corruption() {
     }
 }
 
+/// Reed-Solomon on its own, away from any image. Every claim `dct` makes about
+/// surviving a re-encode rests on this correcting exactly what it promises — and,
+/// just as importantly, refusing what it does not. A decoder that hands back a
+/// confidently miscorrected block is worse than one that admits defeat.
+bool test_ecc() {
+    const std::size_t sizes[] = {0, 1, 16, 222, 223, 224, 700};
+    for (const std::size_t size : sizes) {
+        const std::vector<uint8_t> data = make_noise(size, 909u);
+        const std::vector<uint8_t> code = datum::ecc_encode(data);
+        CHECK(code.size() == datum::ecc_encoded_size(size));
+
+        const auto clean = datum::ecc_decode(code, size);
+        CHECK(clean.has_value());
+        CHECK(*clean == data);
+    }
+
+    // 16 wrong bytes in a block is the published limit, and it has to be reached
+    // rather than approached: a decoder that only manages 15 has less margin than
+    // every table in the docs claims.
+    const std::vector<uint8_t> data = make_noise(200, 55u);
+    std::vector<uint8_t> code = datum::ecc_encode(data);
+    for (std::size_t i = 0; i < 16; ++i) {
+        code[i * 7] ^= 0xA5u;
+    }
+    const auto fixed = datum::ecc_decode(code, data.size());
+    CHECK(fixed.has_value());
+    CHECK(*fixed == data);
+
+    // One past the limit has to be reported, not guessed at.
+    code[16 * 7] ^= 0xA5u;
+    CHECK(!datum::ecc_decode(code, data.size()).has_value());
+
+    // A truncated codeword is missing parity it needs, which is not the same as a
+    // damaged one and must not be treated as one.
+    CHECK(!datum::ecc_decode({code.data(), code.size() - 1}, data.size()).has_value());
+    return true;
+}
+
+/// Replaces a run of blocks with their own mean, which is what a heavy-handed
+/// encoder does to a block it has no bits left for. A flat block has no AC energy
+/// at all, so both coefficients read zero and the bit reads 0 — half of the blocks
+/// hit this way come back wrong, which is exactly the damage the parity is for.
+datum::Image flatten_blocks(datum::Image image, std::size_t first, std::size_t count) {
+    const auto across = static_cast<std::size_t>(image.width / datum::kDctBlock);
+    const auto stride = static_cast<std::size_t>(image.channels);
+    for (std::size_t block = first; block < first + count; ++block) {
+        const std::size_t left = (block % across) * datum::kDctBlock;
+        const std::size_t top = (block / across) * datum::kDctBlock;
+        for (int channel = 0; channel < image.channels; ++channel) {
+            int sum = 0;
+            for (int j = 0; j < datum::kDctBlock; ++j) {
+                for (int i = 0; i < datum::kDctBlock; ++i) {
+                    sum += image.pixels[((top + static_cast<std::size_t>(j)) *
+                                             static_cast<std::size_t>(image.width) +
+                                         left + static_cast<std::size_t>(i)) *
+                                            stride +
+                                        static_cast<std::size_t>(channel)];
+                }
+            }
+            const auto mean = static_cast<uint8_t>(sum / (datum::kDctBlock * datum::kDctBlock));
+            for (int j = 0; j < datum::kDctBlock; ++j) {
+                for (int i = 0; i < datum::kDctBlock; ++i) {
+                    image.pixels[((top + static_cast<std::size_t>(j)) *
+                                      static_cast<std::size_t>(image.width) +
+                                  left + static_cast<std::size_t>(i)) *
+                                     stride +
+                                 static_cast<std::size_t>(channel)] = mean;
+                }
+            }
+        }
+    }
+    return image;
+}
+
+bool test_dct_roundtrip(const std::filesystem::path& dir) {
+    // 512x512 is 4096 blocks, i.e. 512 carrier bytes — the header block alone is 48
+    // of them, so `dct` needs a bigger fixture than the per-pixel modes.
+    for (const int margin : {datum::kLeastMargin, 8, datum::kDefaultMargin, datum::kMostMargin}) {
+        for (int channels = 1; channels <= 4; ++channels) {
+            const std::vector<uint8_t> payload = make_noise(300, 77u);
+            datum::Image image = make_image(512, 512, channels);
+
+            datum::embed_payload(image, datum::Mode::Dct, static_cast<uint8_t>(margin), payload);
+
+            const auto file = dir / "dct.png";
+            datum::save_png(file, image);
+            const datum::Image reloaded = datum::load(file);
+
+            // Not just "the CRC held": every single bit has to come back, with no
+            // help from the parity. Otherwise a codec that quietly fails one block
+            // in fifty would pass, and it would have spent its whole error budget
+            // before the carrier was touched.
+            const std::vector<uint8_t> stream =
+                embedded_stream(datum::Mode::Dct, static_cast<uint8_t>(margin), payload);
+            datum::BitWriter sink;
+            datum::make_codec(datum::Mode::Dct, static_cast<uint8_t>(margin))
+                ->extract(reloaded, sink, stream.size() * 8);
+            CHECK(datum::bit_error_rate(sink.bytes(), stream) == 0.0);
+
+            // Auto-detection must recover the mode and the margin from the header.
+            const datum::Extracted found = datum::extract_payload(reloaded, std::nullopt);
+            CHECK(found.header.mode == datum::Mode::Dct);
+            CHECK(found.header.param == static_cast<uint8_t>(margin));
+            CHECK((found.header.flags & datum::kFlagEcc) != 0);
+            CHECK(found.payload == payload);
+
+            CHECK(datum::extract_payload(reloaded, datum::Mode::Dct).payload == payload);
+        }
+    }
+    return true;
+}
+
+/// The parity earning its keep inside a real carrier. Damage that would cost the
+/// payload without it must not cost one with it — and damage past the correction
+/// limit must still be reported rather than papered over.
+bool test_dct_ecc_corrects() {
+    const std::vector<uint8_t> payload = make_noise(300, 31u);
+    datum::Image stego = make_image(512, 512, 3);
+    datum::embed_payload(stego, datum::Mode::Dct, datum::kDefaultMargin, payload);
+
+    // The first 384 blocks carry the header, so damage starting past them lands in
+    // the payload's own codeword. 100 blocks is 100 bits over 13 bytes, inside the
+    // 16 bytes RS(255,223) can put right.
+    CHECK(datum::extract_payload(flatten_blocks(stego, 384, 100), std::nullopt).payload == payload);
+
+    // 300 blocks spread the damage over ~38 bytes, which is past the limit.
+    try {
+        datum::extract_payload(flatten_blocks(stego, 384, 300), std::nullopt);
+        std::cerr << "FAILED: dct decoded past the Reed-Solomon correction limit\n";
+        return false;
+    } catch (const std::exception&) {
+        // expected
+    }
+
+    // And the header's own codeword: 48 bytes protecting 16, so it survives damage
+    // that would leave a plain header unreadable.
+    CHECK(datum::extract_payload(flatten_blocks(stego, 0, 60), std::nullopt).payload == payload);
+    return true;
+}
+
+/// Phase 6's headline. `qim` reads a bit out of one pixel's value, so a resample —
+/// which replaces that value with an average of its neighbours — takes the payload
+/// with it, at every delta. A DCT coefficient *is* an average over the block, so
+/// the same resample perturbs the bit instead of erasing it.
+///
+/// Both halves are asserted here rather than assumed: the same cover, the same
+/// payload, the two modes side by side.
+bool test_dct_survives_reencode(const std::filesystem::path& dir) {
+    const datum::Image cover = make_photo(384, 384);
+    const std::vector<uint8_t> payload = make_noise(150, 71u);  // of 208 bytes' capacity
+    const auto file = dir / "dct.jpg";
+
+    const auto write_jpeg = [&](const datum::Image& image, int quality) {
+        return stbi_write_jpg(file.string().c_str(),
+                              image.width,
+                              image.height,
+                              image.channels,
+                              image.pixels.data(),
+                              quality) != 0;
+    };
+
+    datum::Image stego = cover;
+    datum::embed_payload(stego, datum::Mode::Dct, datum::kDefaultMargin, payload);
+
+    // Quality 75 is two steps below where qim's default gives up (docs/QIM.md).
+    CHECK(write_jpeg(stego, 75));
+    const datum::Extracted found = datum::extract_payload(datum::load(file), std::nullopt);
+    CHECK(found.header.mode == datum::Mode::Dct);
+    CHECK(found.payload == payload);
+
+    // The wall every spatial mode hits, walked through.
+    CHECK(datum::extract_payload(halve_and_back(stego), std::nullopt).payload == payload);
+
+    // A re-encode *and* a rescale, which is what an upload actually does.
+    CHECK(write_jpeg(halve_and_back(stego), 85));
+    CHECK(datum::extract_payload(datum::load(file), std::nullopt).payload == payload);
+
+    // The control: qim on the same cover, at the same fill, dies on the rescale.
+    // Without it this test would pass for any mode that happened to survive.
+    datum::Image spatial = cover;
+    datum::embed_payload(spatial, datum::Mode::Qim, datum::kDefaultDelta, payload);
+    CHECK(datum::extract_payload(spatial, std::nullopt).payload == payload);
+    try {
+        datum::extract_payload(halve_and_back(spatial), std::nullopt);
+        std::cerr << "FAILED: qim survived the rescale dct is measured against\n";
+        return false;
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Video. These need ffmpeg, so they report a skip rather than a failure when it
 // is missing — a contributor without ffmpeg should still be able to run the suite.
@@ -804,20 +988,85 @@ bool test_video_roundtrip(const std::filesystem::path& dir) {
     return true;
 }
 
+/// What `--repeat` buys, stated as a test: a frame that never arrives.
+///
+/// A spanning payload is a single stream cut across frames, so losing one frame
+/// shifts every bit after it and the payload is gone. Repetition writes the whole
+/// stream into each of several frames instead, so a missing frame costs one vote.
+/// Both halves are asserted, because the first alone would pass for a codec that
+/// simply had enough margin.
+bool test_video_repeat(const std::filesystem::path& dir) {
+    if (!have_ffmpeg()) {
+        std::cout << "  (skipped video repetition: ffmpeg/ffprobe not found)\n";
+        return true;
+    }
+
+    const auto cover = dir / "repeat_cover.mkv";
+    CHECK(make_clip(cover, 640, 480, 20));
+
+    const datum::VideoInfo info = datum::probe(cover);
+    const std::vector<uint8_t> payload = make_noise(200, 606u);
+    CHECK(datum::video_capacity(info, datum::Mode::Dct, datum::kDefaultMargin, 5) > payload.size());
+
+    // Drops the first frame, which is where a spanning payload keeps its header.
+    const auto drop_first = [&](const std::filesystem::path& in, const std::filesystem::path& out) {
+        return run_quiet("\"" + tool("DATUM_FFMPEG", "ffmpeg") + "\" -v error -y -i \"" +
+                         in.string() + "\" -vf trim=start_frame=1,setpts=PTS-STARTPTS -c:v ffv1 " +
+                         "-pix_fmt bgr0 -an \"" + out.string() + "\"");
+    };
+
+    const auto once = dir / "repeat_1.mkv";
+    const auto many = dir / "repeat_5.mkv";
+    CHECK(datum::embed_video(cover, once, datum::Mode::Dct, datum::kDefaultMargin, payload, 1)
+              .frames_used == 1);
+    CHECK(datum::embed_video(cover, many, datum::Mode::Dct, datum::kDefaultMargin, payload, 5)
+              .frames_used == 5);
+
+    // Both read back from the lossless carrier they were written to.
+    CHECK(datum::extract_video(once, std::nullopt).payload == payload);
+    const datum::Extracted voted = datum::extract_video(many, std::nullopt);
+    CHECK(datum::header_repeat(voted.header) == 5);
+    CHECK(voted.payload == payload);
+
+    const auto once_cut = dir / "repeat_1_cut.mkv";
+    const auto many_cut = dir / "repeat_5_cut.mkv";
+    CHECK(drop_first(once, once_cut));
+    CHECK(drop_first(many, many_cut));
+
+    CHECK(datum::extract_video(many_cut, std::nullopt).payload == payload);
+    try {
+        datum::extract_video(once_cut, std::nullopt);
+        std::cerr << "FAILED: a single unrepeated copy survived losing its frame\n";
+        return false;
+    } catch (const std::exception&) {
+        // expected
+    }
+
+    // And the whole point of the phase: a real delivery-grade re-encode, at a
+    // different frame rate, in a lossy container datum would refuse to write itself.
+    const auto delivered = dir / "delivered.mp4";
+    CHECK(run_quiet("\"" + tool("DATUM_FFMPEG", "ffmpeg") + "\" -v error -y -i \"" + many.string() +
+                    "\" -vf fps=24 -c:v libx264 -crf 23 -pix_fmt yuv420p -an \"" +
+                    delivered.string() + "\""));
+    CHECK(datum::extract_video(delivered, std::nullopt).payload == payload);
+    return true;
+}
+
 }  // namespace
 
 int main() {
     const auto dir = std::filesystem::temp_directory_path() / "datum_tests";
     std::filesystem::create_directories(dir);
 
-    const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
-                        test_reports_missing_file(dir) && test_crc32() && test_header() &&
-                        test_bitstream() && test_payload_roundtrip(dir) &&
-                        test_lsb_roundtrip(dir) && test_raw_bits(dir) && test_qim_roundtrip(dir) &&
-                        test_qim_margin() && test_qim_survives_jpeg(dir) &&
-                        test_qim_dies_on_rescale() && test_lsb_is_quiet() && test_steganalysis() &&
-                        test_alpha_is_untouched() && test_rejects_oversized_payload() &&
-                        test_detects_corruption() && test_video_roundtrip(dir);
+    const bool passed =
+        test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
+        test_reports_missing_file(dir) && test_crc32() && test_header() && test_bitstream() &&
+        test_payload_roundtrip(dir) && test_lsb_roundtrip(dir) && test_raw_bits(dir) &&
+        test_qim_roundtrip(dir) && test_qim_margin() && test_qim_survives_jpeg(dir) &&
+        test_qim_dies_on_rescale() && test_ecc() && test_dct_roundtrip(dir) &&
+        test_dct_ecc_corrects() && test_dct_survives_reencode(dir) && test_lsb_is_quiet() &&
+        test_steganalysis() && test_alpha_is_untouched() && test_rejects_oversized_payload() &&
+        test_detects_corruption() && test_video_roundtrip(dir) && test_video_repeat(dir);
 
     std::filesystem::remove_all(dir);
     std::cout << (passed ? "all checks passed\n" : "checks failed\n");

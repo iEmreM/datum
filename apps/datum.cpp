@@ -28,22 +28,30 @@ void print_usage() {
                  "\n"
                  "usage:\n"
                  "  datum info     -i <carrier>\n"
-                 "  datum capacity -i <carrier> [--mode binary|raw|lsb|qim] [--bits N]\n"
-                 "  datum embed    -i <cover> -o <stego> -d <payload>"
-                 " [--mode binary|raw|lsb|qim] [--bits N] [--delta N]\n"
-                 "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb|qim]\n"
+                 "  datum capacity -i <carrier> [--mode M] [--bits N] [--repeat N]\n"
+                 "  datum embed    -i <cover> -o <stego> -d <payload> [--mode M]\n"
+                 "                 [--bits N] [--delta N] [--margin N] [--repeat N]\n"
+                 "  datum extract  -i <stego> -o <payload> [--mode M]\n"
                  "  datum analyze  -i <carrier>\n"
                  "\n"
                  "notes:\n"
+                 "  M is binary, raw, lsb, qim or dct\n"
                  "  a carrier is an image or a video; the extension picks which\n"
                  "  --bits sets the payload bits per colour channel: lsb uses the\n"
                  "  low 1..4 (default 1), raw the top 1..8 (default 8) and centres\n"
                  "  what is left, which leaves raw a +/-2^(7-N) drift margin\n"
-                 "  --delta sets qim's quantiser step, 2..32 (default 28): the one\n"
-                 "  mode that survives a re-encode, at the cost of banding\n"
+                 "  --delta sets qim's quantiser step, 2..32 (default 28): survives\n"
+                 "  a re-encode at the same size, at the cost of banding\n"
+                 "  --margin sets dct's coefficient separation, 2..64 (default\n"
+                 "  32): the only mode that survives a re-encode *and* a rescale,\n"
+                 "  at the cost of a little texture inside each 8x8 block\n"
+                 "  --repeat N writes the whole payload into each of the first N\n"
+                 "  frames of a video and majority-votes them back, so a damaged or\n"
+                 "  dropped frame costs a vote instead of the payload (video only)\n"
                  "  output must be .png for images and .mkv for video — lossy\n"
                  "  formats would erase the payload\n"
-                 "  extract auto-detects the mode and bit depth unless --mode is given\n"
+                 "  extract auto-detects the mode and its parameter unless --mode\n"
+                 "  is given; --repeat is never needed, it is in the header\n"
                  "  analyze runs steganalysis on a carrier — point it at our own\n"
                  "  output to check the hiding actually holds up\n"
                  "  video needs ffmpeg and ffprobe on PATH (or DATUM_FFMPEG /\n"
@@ -113,11 +121,14 @@ datum::Mode require_mode(const Flags& flags, datum::Mode fallback) {
 ///
 /// `lsb` and `raw` take --bits, the payload bits per colour channel: lsb's are the
 /// *low* bits of each channel, raw's the *top* ones. `qim` takes --delta, the
-/// quantiser step whose bin parity carries the bit. A mode with no rule takes
-/// neither, so a flag aimed at the wrong mode is refused rather than ignored.
+/// quantiser step whose bin parity carries the bit. `dct` takes --margin, how far
+/// apart it pushes the two coefficients whose order carries the bit. A mode with no
+/// rule takes none of them, so a flag aimed at the wrong mode is refused rather
+/// than ignored.
 ///
 /// Each default is that mode's quietest useful setting: lsb 1, raw 8 (one payload
-/// byte per channel), qim the step docs/QIM.md measured.
+/// byte per channel), qim the step docs/QIM.md measured, dct the separation
+/// docs/DCT.md measured.
 struct ParamRule {
     std::string_view flag;
     int least = 0;
@@ -133,8 +144,9 @@ ParamRule param_rule(datum::Mode mode) {
             return {"bits", 1, 8, 8};
         case datum::Mode::Qim:
             return {"delta", datum::kLeastDelta, datum::kMostDelta, datum::kDefaultDelta};
-        case datum::Mode::Binary:
         case datum::Mode::Dct:
+            return {"margin", datum::kLeastMargin, datum::kMostMargin, datum::kDefaultMargin};
+        case datum::Mode::Binary:
             break;
     }
     return {};
@@ -142,7 +154,7 @@ ParamRule param_rule(datum::Mode mode) {
 
 uint8_t require_param(const Flags& flags, datum::Mode mode) {
     const ParamRule rule = param_rule(mode);
-    for (const std::string_view name : {"bits", "delta"}) {
+    for (const std::string_view name : {"bits", "delta", "margin"}) {
         if (name != rule.flag && find_flag(flags, std::string(name)) != nullptr) {
             throw std::runtime_error("--" + std::string(name) + " does not apply to --mode " +
                                      std::string(datum::mode_name(mode)));
@@ -173,9 +185,28 @@ void print_distortion(double db) {
     }
 }
 
-void print_capacity(std::string_view label, std::size_t payload) {
-    std::cout << label << ": " << payload << " payload bytes (" << payload / 1024 << " KiB), "
-              << datum::kHeaderSize << " byte header\n";
+void print_capacity(datum::Mode mode, std::size_t payload) {
+    std::cout << datum::mode_name(mode) << ": " << payload << " payload bytes (" << payload / 1024
+              << " KiB), " << datum::header_block_size(mode) << " byte header"
+              << (datum::uses_ecc(mode) ? ", Reed-Solomon parity on top" : "") << "\n";
+}
+
+/// Video-only, and refused rather than ignored on a still: one image is one frame,
+/// so there is nothing to repeat across.
+int require_repeat(const Flags& flags, bool video) {
+    const std::string* given = find_flag(flags, "repeat");
+    if (given == nullptr) {
+        return 1;
+    }
+    if (!video) {
+        throw std::runtime_error("--repeat applies to video only: an image is a single frame");
+    }
+    const int value = std::stoi(*given);
+    if (value < datum::kLeastRepeat || value > datum::kMostRepeat) {
+        throw std::runtime_error("--repeat must be between " + std::to_string(datum::kLeastRepeat) +
+                                 " and " + std::to_string(datum::kMostRepeat));
+    }
+    return value;
 }
 
 int run_info(const Flags& flags) {
@@ -202,14 +233,15 @@ int run_capacity(const Flags& flags) {
 
     if (datum::is_video(input)) {
         const datum::VideoInfo info = datum::probe(input);
-        print_capacity(datum::mode_name(mode), datum::video_capacity(info, mode, param));
+        const int repeat = require_repeat(flags, true);
+        print_capacity(mode, datum::video_capacity(info, mode, param, repeat));
         return 0;
     }
 
     const datum::Image image = datum::load(input);
-    const std::size_t total = datum::make_codec(mode, param)->capacity(image);
-    print_capacity(datum::mode_name(mode),
-                   total > datum::kHeaderSize ? total - datum::kHeaderSize : 0);
+    require_repeat(flags, false);
+    print_capacity(mode,
+                   datum::payload_capacity(mode, datum::make_codec(mode, param)->capacity(image)));
     return 0;
 }
 
@@ -221,14 +253,18 @@ int run_embed(const Flags& flags) {
     const uint8_t param = require_param(flags, mode);
 
     if (datum::is_video(input)) {
-        const datum::VideoStats stats = datum::embed_video(input, output, mode, param, payload);
+        const int repeat = require_repeat(flags, true);
+        const datum::VideoStats stats =
+            datum::embed_video(input, output, mode, param, payload, repeat);
         std::cout << "embedded " << payload.size() << " bytes in " << datum::mode_name(mode)
-                  << " mode, filling " << stats.frames_used << " of " << stats.frames << " frames";
+                  << " mode, " << (repeat > 1 ? "copied into " : "filling ") << stats.frames_used
+                  << " of " << stats.frames << " frames";
         print_distortion(stats.psnr);
         std::cout << "\n";
         return 0;
     }
 
+    require_repeat(flags, false);
     datum::Image image = datum::load(input);
     const datum::Image cover = image;  // kept only to measure the distortion below
     datum::embed_payload(image, mode, param, payload);
@@ -311,12 +347,16 @@ int main(int argc, char** argv) {
             return run_info(parse_flags(argc, argv, 2, command, {"i"}));
         }
         if (command == "capacity") {
-            return run_capacity(
-                parse_flags(argc, argv, 2, command, {"i", "mode", "bits", "delta"}));
+            return run_capacity(parse_flags(
+                argc, argv, 2, command, {"i", "mode", "bits", "delta", "margin", "repeat"}));
         }
         if (command == "embed") {
             return run_embed(
-                parse_flags(argc, argv, 2, command, {"i", "o", "d", "mode", "bits", "delta"}));
+                parse_flags(argc,
+                            argv,
+                            2,
+                            command,
+                            {"i", "o", "d", "mode", "bits", "delta", "margin", "repeat"}));
         }
         if (command == "extract") {
             return run_extract(parse_flags(argc, argv, 2, command, {"i", "o", "mode"}));
