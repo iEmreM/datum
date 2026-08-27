@@ -12,6 +12,11 @@
 #include <string>
 #include <vector>
 
+// Declarations only — datum_core carries stb's implementation. A JPEG round trip is
+// the cheapest real lossy re-encode, and going through stb rather than ffmpeg keeps
+// the qim robustness check running everywhere, including a CI job with no ffmpeg.
+#include <stb_image_write.h>
+
 #include "datum/analyze.hpp"
 #include "datum/bitstream.hpp"
 #include "datum/codec.hpp"
@@ -382,6 +387,220 @@ bool test_steganalysis() {
     return true;
 }
 
+/// Shifts whole pixels — every colour channel by the same amount, which is the only
+/// way a qim carrier is meant to move. Even and odd pixels go opposite ways so no
+/// drift can cancel out across the image.
+datum::Image push_pixels(datum::Image image, int even, int odd) {
+    const auto stride = static_cast<std::size_t>(image.channels);
+    for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
+        const int by = pixel % 2 == 0 ? even : odd;
+        for (int channel = 0; channel < image.color_channels(); ++channel) {
+            uint8_t& sample = image.pixels[pixel * stride + static_cast<std::size_t>(channel)];
+            sample = static_cast<uint8_t>(std::clamp(static_cast<int>(sample) + by, 0, 255));
+        }
+    }
+    return image;
+}
+
+/// A 2x2 box downscale followed by a pixel-doubling upscale: the cheapest honest
+/// model of a resample, and the only part of one that matters here — a sample is
+/// *replaced* by the mean of its neighbours instead of being nudged.
+datum::Image halve_and_back(datum::Image image) {
+    const datum::Image source = image;
+    const auto stride = static_cast<std::size_t>(image.channels);
+    const auto at = [&](int x, int y, int channel) {
+        return (static_cast<std::size_t>(y) * static_cast<std::size_t>(source.width) +
+                static_cast<std::size_t>(x)) *
+                   stride +
+               static_cast<std::size_t>(channel);
+    };
+
+    for (int y = 0; y + 1 < image.height; y += 2) {
+        for (int x = 0; x + 1 < image.width; x += 2) {
+            for (int channel = 0; channel < image.channels; ++channel) {
+                int sum = 0;
+                for (int j = 0; j < 2; ++j) {
+                    for (int i = 0; i < 2; ++i) {
+                        sum += source.pixels[at(x + i, y + j, channel)];
+                    }
+                }
+                const auto mean = static_cast<uint8_t>((sum + 2) / 4);
+                for (int j = 0; j < 2; ++j) {
+                    for (int i = 0; i < 2; ++i) {
+                        image.pixels[at(x + i, y + j, channel)] = mean;
+                    }
+                }
+            }
+        }
+    }
+    return image;
+}
+
+/// The stream `embed_payload` would have written, so a test can measure how many of
+/// those bits came back wrong rather than only whether the CRC held.
+std::vector<uint8_t> embedded_stream(datum::Mode mode,
+                                     uint8_t param,
+                                     const std::vector<uint8_t>& payload) {
+    datum::Header header;
+    header.mode = mode;
+    header.param = param;
+    header.payload_len = static_cast<uint32_t>(payload.size());
+    header.payload_crc = datum::crc32(payload);
+
+    std::vector<uint8_t> stream = datum::serialize(header);
+    stream.insert(stream.end(), payload.begin(), payload.end());
+    return stream;
+}
+
+bool test_qim_roundtrip(const std::filesystem::path& dir) {
+    for (const int delta : {2, 3, 8, 20, 31, 32}) {
+        for (int channels = 1; channels <= 4; ++channels) {
+            // 100x100 holds 1250 bytes in qim — one bit per pixel, not per channel.
+            const std::vector<uint8_t> payload = make_noise(1000, 77u);
+            datum::Image image = make_image(100, 100, channels);
+
+            datum::embed_payload(image, datum::Mode::Qim, static_cast<uint8_t>(delta), payload);
+
+            const auto file = dir / "qim.png";
+            datum::save_png(file, image);
+            const datum::Image reloaded = datum::load(file);
+
+            // Auto-detection must recover both the mode and delta from the header.
+            const datum::Extracted found = datum::extract_payload(reloaded, std::nullopt);
+            CHECK(found.header.mode == datum::Mode::Qim);
+            CHECK(found.header.param == static_cast<uint8_t>(delta));
+            CHECK(found.payload == payload);
+
+            // Forcing qim without naming the delta must agree — it comes from the header.
+            CHECK(datum::extract_payload(reloaded, datum::Mode::Qim).payload == payload);
+        }
+    }
+
+    // A pixel whose channels already span the range has no room to move as a whole,
+    // so the codec desaturates it first. That path only runs at the extremes, and it
+    // still has to round-trip — otherwise a saturated cover would silently lose bits.
+    datum::Image extreme = make_image(64, 64, 3);
+    for (std::size_t pixel = 0; pixel < extreme.pixel_count(); ++pixel) {
+        extreme.pixels[pixel * 3] = 0;
+        extreme.pixels[pixel * 3 + 1] = 128;
+        extreme.pixels[pixel * 3 + 2] = 255;
+    }
+    const std::vector<uint8_t> payload = make_noise(400, 78u);
+    datum::embed_payload(extreme, datum::Mode::Qim, datum::kMostDelta, payload);
+    CHECK(datum::extract_payload(extreme, std::nullopt).payload == payload);
+    return true;
+}
+
+/// The margin is the entire mode: anything that moves a pixel by less than half a
+/// step decodes to the same bin, and anything that moves it further does not. Both
+/// halves are asserted, because the first alone would pass for a codec that simply
+/// ignored the payload.
+bool test_qim_margin() {
+    // Mid-range cover, so pushing in either direction cannot clip at 0 or 255 and
+    // turn a margin test into a clamping test.
+    datum::Image cover = make_image(64, 64, 3);
+    for (auto& sample : cover.pixels) {
+        sample = static_cast<uint8_t>(64 + sample / 4);
+    }
+
+    for (const int delta : {4, 12, 20, 32}) {
+        const std::vector<uint8_t> payload = make_noise(400, 55u);
+        datum::Image stego = cover;
+        datum::embed_payload(stego, datum::Mode::Qim, static_cast<uint8_t>(delta), payload);
+        CHECK(datum::extract_payload(stego, std::nullopt).payload == payload);
+
+        const int margin = delta / 2;
+        CHECK(push_pixels(stego, margin - 1, -margin).pixels != stego.pixels);
+        CHECK(
+            datum::extract_payload(push_pixels(stego, margin - 1, -margin), std::nullopt).payload ==
+            payload);
+
+        // One step past the edge has to break, or the margin above proves nothing
+        // about where the boundary actually is.
+        try {
+            datum::extract_payload(push_pixels(stego, margin, margin), std::nullopt);
+            std::cerr << "FAILED: qim delta=" << delta << " decoded past its half step\n";
+            return false;
+        } catch (const std::exception&) {
+            // expected
+        }
+    }
+    return true;
+}
+
+/// Phase 5's headline, and the reason qim gives up ~25 dB of PSNR: a real lossy
+/// re-encode at the same resolution no longer destroys the payload. JPEG at quality
+/// 95 is the strongest re-encoder the measurements in docs/QIM.md say the default
+/// delta clears, so that is what is pinned here.
+///
+/// The `lsb` half is not decoration — without it this would pass for any mode that
+/// happened to survive, and the point is that the modes before this one did not.
+bool test_qim_survives_jpeg(const std::filesystem::path& dir) {
+    const datum::Image cover = make_photo(256, 256);
+    const std::vector<uint8_t> payload = make_noise(2000, 71u);  // of 8192 bytes' capacity
+    const auto file = dir / "reencoded.jpg";
+
+    const auto write_jpeg = [&](const datum::Image& image) {
+        return stbi_write_jpg(file.string().c_str(),
+                              image.width,
+                              image.height,
+                              image.channels,
+                              image.pixels.data(),
+                              95) != 0;
+    };
+
+    datum::Image stego = cover;
+    datum::embed_payload(stego, datum::Mode::Qim, datum::kDefaultDelta, payload);
+    CHECK(write_jpeg(stego));
+
+    const datum::Extracted found = datum::extract_payload(datum::load(file), std::nullopt);
+    CHECK(found.header.mode == datum::Mode::Qim);
+    CHECK(found.header.param == datum::kDefaultDelta);
+    CHECK(found.payload == payload);
+
+    datum::Image invisible = cover;
+    datum::embed_payload(invisible, datum::Mode::Lsb, 1, payload);
+    CHECK(write_jpeg(invisible));
+    try {
+        datum::extract_payload(datum::load(file), std::nullopt);
+        std::cerr << "FAILED: lsb survived a JPEG re-encode\n";
+        return false;
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
+/// And the documented limit, asserted rather than left to be discovered: a resample
+/// replaces a pixel with the mean of its neighbours, which is not a nudge, so no
+/// margin defends against it. qim covers "re-encoded at the same resolution" and
+/// nothing beyond — that line is what Phase 6's dct mode exists to cross.
+bool test_qim_dies_on_rescale() {
+    const datum::Image cover = make_photo(128, 128);
+    const std::vector<uint8_t> payload = make_noise(1000, 66u);  // of 2048 bytes' capacity
+    const std::vector<uint8_t> stream =
+        embedded_stream(datum::Mode::Qim, datum::kDefaultDelta, payload);
+
+    datum::Image stego = cover;
+    datum::embed_payload(stego, datum::Mode::Qim, datum::kDefaultDelta, payload);
+
+    const auto codec = datum::make_codec(datum::Mode::Qim, datum::kDefaultDelta);
+    const auto read_back = [&](const datum::Image& image) {
+        datum::BitWriter sink;
+        codec->extract(image, sink, stream.size() * 8);
+        return datum::bit_error_rate(sink.bytes(), stream);
+    };
+
+    CHECK(read_back(stego) == 0.0);
+    CHECK(read_back(halve_and_back(stego)) > 0.20);
+    try {
+        datum::extract_payload(halve_and_back(stego), std::nullopt);
+        std::cerr << "FAILED: qim survived a rescale\n";
+        return false;
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
 bool test_lsb_is_quiet() {
     // k = 1 must be near-invisible: each touched channel moves by at most 1, so a
     // well-filled image still sits above 50 dB — and below 60, proving it changed.
@@ -591,12 +810,14 @@ int main() {
     const auto dir = std::filesystem::temp_directory_path() / "datum_tests";
     std::filesystem::create_directories(dir);
 
-    const bool passed =
-        test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
-        test_reports_missing_file(dir) && test_crc32() && test_header() && test_bitstream() &&
-        test_payload_roundtrip(dir) && test_lsb_roundtrip(dir) && test_raw_bits(dir) &&
-        test_lsb_is_quiet() && test_steganalysis() && test_alpha_is_untouched() &&
-        test_rejects_oversized_payload() && test_detects_corruption() && test_video_roundtrip(dir);
+    const bool passed = test_image_roundtrip(dir) && test_rejects_lossy_destination(dir) &&
+                        test_reports_missing_file(dir) && test_crc32() && test_header() &&
+                        test_bitstream() && test_payload_roundtrip(dir) &&
+                        test_lsb_roundtrip(dir) && test_raw_bits(dir) && test_qim_roundtrip(dir) &&
+                        test_qim_margin() && test_qim_survives_jpeg(dir) &&
+                        test_qim_dies_on_rescale() && test_lsb_is_quiet() && test_steganalysis() &&
+                        test_alpha_is_untouched() && test_rejects_oversized_payload() &&
+                        test_detects_corruption() && test_video_roundtrip(dir);
 
     std::filesystem::remove_all(dir);
     std::cout << (passed ? "all checks passed\n" : "checks failed\n");

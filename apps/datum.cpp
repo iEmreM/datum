@@ -28,10 +28,10 @@ void print_usage() {
                  "\n"
                  "usage:\n"
                  "  datum info     -i <carrier>\n"
-                 "  datum capacity -i <carrier> [--mode binary|raw|lsb] [--bits N]\n"
+                 "  datum capacity -i <carrier> [--mode binary|raw|lsb|qim] [--bits N]\n"
                  "  datum embed    -i <cover> -o <stego> -d <payload>"
-                 " [--mode binary|raw|lsb] [--bits N]\n"
-                 "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb]\n"
+                 " [--mode binary|raw|lsb|qim] [--bits N] [--delta N]\n"
+                 "  datum extract  -i <stego> -o <payload> [--mode binary|raw|lsb|qim]\n"
                  "  datum analyze  -i <carrier>\n"
                  "\n"
                  "notes:\n"
@@ -39,6 +39,8 @@ void print_usage() {
                  "  --bits sets the payload bits per colour channel: lsb uses the\n"
                  "  low 1..4 (default 1), raw the top 1..8 (default 8) and centres\n"
                  "  what is left, which leaves raw a +/-2^(7-N) drift margin\n"
+                 "  --delta sets qim's quantiser step, 2..32 (default 28): the one\n"
+                 "  mode that survives a re-encode, at the cost of banding\n"
                  "  output must be .png for images and .mkv for video — lossy\n"
                  "  formats would erase the payload\n"
                  "  extract auto-detects the mode and bit depth unless --mode is given\n"
@@ -107,29 +109,57 @@ datum::Mode require_mode(const Flags& flags, datum::Mode fallback) {
     return *mode;
 }
 
-/// The per-mode parameter carried in the header: payload bits per colour channel,
-/// which both lsb and raw use — lsb's k is how many *low* bits carry payload, raw's
-/// is how many *top* bits do. Modes without a parameter reject --bits, so a typo is
-/// not silently ignored.
+/// The flag that sets a mode's header parameter, its range and its default.
 ///
-/// Each default is that mode's original behaviour: lsb 1 (the quietest), raw 8 (one
-/// payload byte per channel).
+/// `lsb` and `raw` take --bits, the payload bits per colour channel: lsb's are the
+/// *low* bits of each channel, raw's the *top* ones. `qim` takes --delta, the
+/// quantiser step whose bin parity carries the bit. A mode with no rule takes
+/// neither, so a flag aimed at the wrong mode is refused rather than ignored.
+///
+/// Each default is that mode's quietest useful setting: lsb 1, raw 8 (one payload
+/// byte per channel), qim the step docs/QIM.md measured.
+struct ParamRule {
+    std::string_view flag;
+    int least = 0;
+    int most = 0;
+    int fallback = 0;
+};
+
+ParamRule param_rule(datum::Mode mode) {
+    switch (mode) {
+        case datum::Mode::Lsb:
+            return {"bits", 1, 4, 1};
+        case datum::Mode::Raw:
+            return {"bits", 1, 8, 8};
+        case datum::Mode::Qim:
+            return {"delta", datum::kLeastDelta, datum::kMostDelta, datum::kDefaultDelta};
+        case datum::Mode::Binary:
+        case datum::Mode::Dct:
+            break;
+    }
+    return {};
+}
+
 uint8_t require_param(const Flags& flags, datum::Mode mode) {
-    const std::string* bits = find_flag(flags, "bits");
-    const bool lsb = mode == datum::Mode::Lsb;
-    if (!lsb && mode != datum::Mode::Raw) {
-        if (bits != nullptr) {
-            throw std::runtime_error("--bits only applies to --mode lsb or --mode raw");
+    const ParamRule rule = param_rule(mode);
+    for (const std::string_view name : {"bits", "delta"}) {
+        if (name != rule.flag && find_flag(flags, std::string(name)) != nullptr) {
+            throw std::runtime_error("--" + std::string(name) + " does not apply to --mode " +
+                                     std::string(datum::mode_name(mode)));
         }
+    }
+    if (rule.flag.empty()) {
         return 0;
     }
-    const int most = lsb ? 4 : 8;
-    const int k = bits == nullptr ? (lsb ? 1 : 8) : std::stoi(*bits);
-    if (k < 1 || k > most) {
-        throw std::runtime_error("--bits must be between 1 and " + std::to_string(most) + " for " +
-                                 std::string(datum::mode_name(mode)) + " mode");
+
+    const std::string* given = find_flag(flags, std::string(rule.flag));
+    const int value = given == nullptr ? rule.fallback : std::stoi(*given);
+    if (value < rule.least || value > rule.most) {
+        throw std::runtime_error("--" + std::string(rule.flag) + " must be between " +
+                                 std::to_string(rule.least) + " and " + std::to_string(rule.most) +
+                                 " for " + std::string(datum::mode_name(mode)) + " mode");
     }
-    return static_cast<uint8_t>(k);
+    return static_cast<uint8_t>(value);
 }
 
 // ponytail: argv is ANSI on Windows, so non-ASCII paths mangle here even though the
@@ -281,10 +311,12 @@ int main(int argc, char** argv) {
             return run_info(parse_flags(argc, argv, 2, command, {"i"}));
         }
         if (command == "capacity") {
-            return run_capacity(parse_flags(argc, argv, 2, command, {"i", "mode", "bits"}));
+            return run_capacity(
+                parse_flags(argc, argv, 2, command, {"i", "mode", "bits", "delta"}));
         }
         if (command == "embed") {
-            return run_embed(parse_flags(argc, argv, 2, command, {"i", "o", "d", "mode", "bits"}));
+            return run_embed(
+                parse_flags(argc, argv, 2, command, {"i", "o", "d", "mode", "bits", "delta"}));
         }
         if (command == "extract") {
             return run_extract(parse_flags(argc, argv, 2, command, {"i", "o", "mode"}));

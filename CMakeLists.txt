@@ -38,9 +38,18 @@ add_executable(datum apps/datum.cpp)
 target_link_libraries(datum PRIVATE datum_core)
 target_compile_options(datum PRIVATE ${DATUM_WARNINGS})
 
+# The Phase 5 robustness harness. Built with everything else so -Werror keeps it
+# honest, but not registered as a test: it needs ffmpeg and its output is a table.
+add_executable(datum_robustness tools/robustness.cpp)
+target_link_libraries(datum_robustness PRIVATE datum_core)
+target_include_directories(datum_robustness SYSTEM PRIVATE third_party/stb)
+target_compile_options(datum_robustness PRIVATE ${DATUM_WARNINGS})
+
 enable_testing()
 add_executable(datum_tests tests/roundtrip.cpp)
 target_link_libraries(datum_tests PRIVATE datum_core)
+# The qim robustness check needs a real JPEG encoder; stb already is one.
+target_include_directories(datum_tests SYSTEM PRIVATE third_party/stb)
 target_compile_options(datum_tests PRIVATE ${DATUM_WARNINGS})
 add_test(NAME roundtrip COMMAND datum_tests)
 

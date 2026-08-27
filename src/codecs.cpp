@@ -210,6 +210,137 @@ class RawCodec final : public Codec {
     int k_;
 };
 
+/// The bin a value falls in: round(value / delta).
+int qim_bin(int value, int delta) {
+    return (value + delta / 2) / delta;
+}
+
+/// The multiple of `delta` nearest `value` whose bin index has the parity of `bit`,
+/// kept inside [low, high].
+///
+/// Bins of the right parity sit 2*delta apart, so a window at least that wide always
+/// holds one and a single step of two is always enough to get back inside — which is
+/// exactly the room `carry_bit` makes before it calls here.
+int qim_target(int value, bool bit, int delta, int low, int high) {
+    int bin = qim_bin(value, delta);
+    if ((bin & 1) != static_cast<int>(bit)) {
+        bin += value > bin * delta ? 1 : -1;  // both neighbours qualify; take the nearer
+    }
+    if (bin * delta > high) {
+        bin -= 2;
+    }
+    if (bin * delta < low) {
+        bin += 2;
+    }
+    return bin * delta;
+}
+
+/// How far every colour channel of a pixel can move *together* before one of them
+/// clips. The width `up - down` is 255 minus the spread between the channels, so a
+/// near-grey pixel can move almost anywhere and a fully saturated one cannot move
+/// at all.
+struct Headroom {
+    int down = 0;
+    int up = 0;
+};
+
+Headroom headroom(const uint8_t* channels, int colors) {
+    int least = 255;
+    int most = 0;
+    for (int i = 0; i < colors; ++i) {
+        least = std::min(least, static_cast<int>(channels[i]));
+        most = std::max(most, static_cast<int>(channels[i]));
+    }
+    return {-least, 255 - most};
+}
+
+/// Shifts a whole pixel so that its luma lands on a quantisation bin whose index has
+/// the parity of `bit`.
+///
+/// Every colour channel moves by the *same* offset, which is the entire design. The
+/// differences between the channels — the colour — come through untouched, so a
+/// codec that stores chroma at quarter resolution has nothing of ours to average
+/// away, and BT.601 luma read back from the decoded pixel is the luma the codec
+/// kept. Writing the three channels independently, as this mode did first, puts the
+/// payload in the chroma as well and 4:2:0 erases it outright: measured in
+/// docs/QIM.md, and the same wall `raw` hit in docs/RAW_BITS.md.
+void carry_bit(Image& image, std::size_t pixel, bool bit, int delta) {
+    const int colors = image.color_channels();
+    uint8_t* channels = &image.pixels[sample_index(image, pixel, 0)];
+
+    Headroom room = headroom(channels, colors);
+    if (room.up - room.down < 2 * delta) {
+        // A pixel this saturated has no room to move as a whole, so pull its channels
+        // toward their own luma until it has. Skipping such pixels instead would make
+        // the decoder guess which ones were skipped, from values a re-encode has
+        // already nudged — and one wrong guess shifts every bit after it. Desaturating
+        // a handful of extremes is the cheaper price, and at delta <= 32 it leaves 191
+        // of the 255 levels of spread alone, so a photograph barely triggers it.
+        const int centre = luma(image, pixel);
+        const int want = 255 - 2 * delta;
+        const int have = 255 - (room.up - room.down);
+        for (int i = 0; i < colors; ++i) {
+            channels[i] = static_cast<uint8_t>(centre + (channels[i] - centre) * want / have);
+        }
+        room = headroom(channels, colors);
+    }
+
+    const int value = luma(image, pixel);
+    const int offset = qim_target(value, bit, delta, value + room.down, value + room.up) - value;
+    for (int i = 0; i < colors; ++i) {
+        channels[i] = static_cast<uint8_t>(channels[i] + offset);
+    }
+}
+
+/// L5: a pixel's luma is snapped to a multiple of delta, and the bit is the parity of
+/// that multiple — Quantization Index Modulation.
+///
+/// Amplitude is the point. `lsb` hides inside a change smaller than a codec's
+/// quantiser step, which is exactly why the codec erases it; QIM makes the change
+/// *bigger* than the step and reads it back out of the rounding. Anything that moves
+/// the luma by less than delta/2 still decodes to the same bin, so delta is a direct
+/// robustness dial: small is quiet and fragile, large survives a harder re-encode and
+/// pays for it in banding across flat regions. docs/QIM.md has the measured table and
+/// where the default came from.
+///
+/// It is a spatial technique, so it holds only while the pixel grid does. A re-encode
+/// at the same resolution nudges values and QIM rounds the nudge away; a rescale
+/// *averages* neighbouring pixels, which replaces a value rather than nudging it, and
+/// no margin defends against that. That is the line between this mode and `dct`.
+class QimCodec final : public Codec {
+  public:
+    explicit QimCodec(int delta) : delta_(delta) {
+        if (delta < kLeastDelta || delta > kMostDelta) {
+            throw std::runtime_error("qim delta must be between " + std::to_string(kLeastDelta) +
+                                     " and " + std::to_string(kMostDelta));
+        }
+    }
+
+    /// One bit per pixel, not per channel: the three channels move together and
+    /// carry one bit between them, which is what buys the chroma coherence above.
+    std::size_t capacity(const Image& image) const override {
+        return image.pixel_count() / 8;
+    }
+
+    void embed(Image& image, BitReader& source) const override {
+        for (std::size_t pixel = 0; pixel < image.pixel_count() && !source.exhausted(); ++pixel) {
+            carry_bit(image, pixel, source.read(), delta_);
+        }
+    }
+
+    void extract(const Image& image, BitWriter& sink, std::size_t bits) const override {
+        for (std::size_t pixel = 0; pixel < image.pixel_count(); ++pixel) {
+            if (sink.size() >= bits) {
+                return;
+            }
+            sink.write((qim_bin(luma(image, pixel), delta_) & 1) != 0);
+        }
+    }
+
+  private:
+    int delta_;
+};
+
 }  // namespace
 
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
@@ -223,6 +354,7 @@ std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param) {
         case Mode::Lsb:
             return std::make_unique<LsbCodec>(param);
         case Mode::Qim:
+            return std::make_unique<QimCodec>(param);
         case Mode::Dct:
             break;
     }
@@ -241,6 +373,9 @@ std::vector<std::pair<Mode, uint8_t>> detection_candidates() {
     }
     for (uint8_t k = 1; k <= 4; ++k) {
         candidates.emplace_back(Mode::Lsb, k);
+    }
+    for (auto delta = static_cast<uint8_t>(kLeastDelta); delta <= kMostDelta; ++delta) {
+        candidates.emplace_back(Mode::Qim, delta);
     }
     return candidates;
 }

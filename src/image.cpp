@@ -84,6 +84,15 @@ void save_png(const std::filesystem::path& file, const Image& image) {
     write_bytes(file, encoded);
 }
 
+int luma(const Image& image, std::size_t pixel) {
+    const std::size_t at = pixel * static_cast<std::size_t>(image.channels);
+    if (image.color_channels() < 3) {
+        return image.pixels[at];
+    }
+    return (77 * image.pixels[at] + 150 * image.pixels[at + 1] + 29 * image.pixels[at + 2] + 128) >>
+           8;
+}
+
 double psnr_from_squared_error(double sum_squared_error, std::size_t samples) {
     if (samples == 0) {
         throw std::runtime_error("psnr: nothing to compare");
@@ -106,6 +115,58 @@ double psnr(const Image& a, const Image& b) {
         sum_squared_error += diff * diff;
     }
     return psnr_from_squared_error(sum_squared_error, a.pixels.size());
+}
+
+double ssim(const Image& a, const Image& b) {
+    if (a.width != b.width || a.height != b.height || a.channels != b.channels ||
+        a.pixels.size() != b.pixels.size()) {
+        throw std::runtime_error("ssim: images differ in shape");
+    }
+
+    // ponytail: 8x8 uniform windows instead of the published 11x11 Gaussian. On the
+    // same pair of images the two agree to a few thousandths, and what this is used
+    // for is ranking one delta against another, not the third decimal.
+    constexpr int kWindow = 8;
+    constexpr double kCount = kWindow * kWindow;
+    constexpr double kC1 = 6.5025;   // (0.01 * 255)^2
+    constexpr double kC2 = 58.5225;  // (0.03 * 255)^2
+
+    double total = 0.0;
+    std::size_t windows = 0;
+    for (int y = 0; y + kWindow <= a.height; y += kWindow) {
+        for (int x = 0; x + kWindow <= a.width; x += kWindow) {
+            double sum_a = 0.0;
+            double sum_b = 0.0;
+            double sum_aa = 0.0;
+            double sum_bb = 0.0;
+            double sum_ab = 0.0;
+            for (int j = 0; j < kWindow; ++j) {
+                const auto row =
+                    static_cast<std::size_t>(y + j) * static_cast<std::size_t>(a.width);
+                for (int i = 0; i < kWindow; ++i) {
+                    const std::size_t pixel = row + static_cast<std::size_t>(x + i);
+                    const double va = luma(a, pixel);
+                    const double vb = luma(b, pixel);
+                    sum_a += va;
+                    sum_b += vb;
+                    sum_aa += va * va;
+                    sum_bb += vb * vb;
+                    sum_ab += va * vb;
+                }
+            }
+            const double mean_a = sum_a / kCount;
+            const double mean_b = sum_b / kCount;
+            const double bessel = kCount / (kCount - 1.0);
+            const double var_a = (sum_aa / kCount - mean_a * mean_a) * bessel;
+            const double var_b = (sum_bb / kCount - mean_b * mean_b) * bessel;
+            const double covariance = (sum_ab / kCount - mean_a * mean_b) * bessel;
+            total += ((2.0 * mean_a * mean_b + kC1) * (2.0 * covariance + kC2)) /
+                     ((mean_a * mean_a + mean_b * mean_b + kC1) * (var_a + var_b + kC2));
+            ++windows;
+        }
+    }
+    // Smaller than one window: nothing structural to compare, so nothing to report.
+    return windows == 0 ? 1.0 : total / static_cast<double>(windows);
 }
 
 }  // namespace datum

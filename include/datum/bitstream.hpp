@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -7,6 +9,22 @@
 #include <vector>
 
 namespace datum {
+
+/// Share of bits that differ between two byte sequences, over the shorter of the
+/// two. This is the pass/fail number of every robustness measurement: a mode that
+/// survives a re-encode reads 0 here, one that does not reads about 0.5, which is
+/// what guessing scores.
+inline double bit_error_rate(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+    const std::size_t bytes = std::min(a.size(), b.size());
+    if (bytes == 0) {
+        return 0.0;
+    }
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        wrong += static_cast<std::size_t>(std::popcount(static_cast<uint8_t>(a[i] ^ b[i])));
+    }
+    return static_cast<double>(wrong) / static_cast<double>(bytes * 8);
+}
 
 /// Reads bits MSB-first out of a byte sequence.
 ///

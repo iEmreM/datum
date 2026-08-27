@@ -32,6 +32,13 @@ class Codec {
     virtual void extract(const Image& image, BitWriter& sink, std::size_t bits) const = 0;
 };
 
+/// The quantiser step `qim` accepts, and the default docs/QIM.md settled on. Below
+/// the smallest there is no margin worth the name; above the largest the banding
+/// costs more than the extra margin buys.
+inline constexpr int kLeastDelta = 2;
+inline constexpr int kMostDelta = 32;
+inline constexpr int kDefaultDelta = 28;
+
 /// Throws std::runtime_error for modes that are not implemented yet.
 std::unique_ptr<Codec> make_codec(Mode mode, uint8_t param);
 

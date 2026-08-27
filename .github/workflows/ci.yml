@@ -46,5 +46,5 @@ jobs:
       - run: pip install clang-format
       # third_party/ is vendored upstream code and is deliberately not reformatted.
       - run: |
-          find include src apps tests -name '*.hpp' -o -name '*.cpp' \
+          find include src apps tests tools -name '*.hpp' -o -name '*.cpp' \
             | xargs clang-format --dry-run --Werror
