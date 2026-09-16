@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(datum LANGUAGES CXX)
+project(datum VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,8 @@ target_compile_options(datum_core PRIVATE ${DATUM_WARNINGS})
 add_executable(datum apps/datum.cpp)
 target_link_libraries(datum PRIVATE datum_core)
 target_compile_options(datum PRIVATE ${DATUM_WARNINGS})
+# The one place the version lives; the release workflow checks the tag against it.
+target_compile_definitions(datum PRIVATE DATUM_VERSION="${PROJECT_VERSION}")
 
 # The Phase 5 robustness harness. Built with everything else so -Werror keeps it
 # honest, but not registered as a test: it needs ffmpeg and its output is a table.
@@ -60,3 +62,7 @@ add_test(NAME cli_rejects_unknown_flag
          COMMAND datum embed -i cover.png -o out.png -d payload.bin --bit 4)
 set_tests_properties(cli_rejects_unknown_flag PROPERTIES
                      PASS_REGULAR_EXPRESSION "unknown flag --bit")
+
+add_test(NAME cli_reports_version COMMAND datum --version)
+set_tests_properties(cli_reports_version PROPERTIES
+                     PASS_REGULAR_EXPRESSION "^datum ${PROJECT_VERSION}")

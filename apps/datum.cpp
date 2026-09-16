@@ -33,6 +33,7 @@ void print_usage() {
                  "                 [--bits N] [--delta N] [--margin N] [--repeat N]\n"
                  "  datum extract  -i <stego> -o <payload> [--mode M]\n"
                  "  datum analyze  -i <carrier>\n"
+                 "  datum --version\n"
                  "\n"
                  "notes:\n"
                  "  M is binary, raw, lsb, qim or dct\n"
@@ -339,6 +340,10 @@ int main(int argc, char** argv) {
     const std::string command = argv[1];
     if (command == "-h" || command == "--help" || command == "help") {
         print_usage();
+        return 0;
+    }
+    if (command == "--version" || command == "version") {
+        std::cout << "datum " << DATUM_VERSION << "\n";
         return 0;
     }
 

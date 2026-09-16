@@ -20,6 +20,8 @@ still ahead. The user-facing guide is [`README.md`](../README.md); measurements 
 | 6 | `dct` mode, Reed–Solomon, temporal repetition | ✅ (real YouTube upload not run) |
 | 7 | Parallelism and profiling | ☐ |
 
+**Releases:** `v0.1.0` is the first, covering Phases 0–6 (§12).
+
 **Next up, in order:** settle the Phase 4b header question (§6, Phase 4b), build 4b,
 then Phase 7. Everything else that is open — limitations, tech debt, stretch goals — is
 collected in [§11](#11-open-work-and-backlog).
@@ -305,12 +307,15 @@ tree as it stands; entries marked *planned* do not exist yet.
 
 ```
 datum/
-├── .github/workflows/ci.yml     # Windows (MSYS2 UCRT64) + Linux build and ctest, clang-format check
+├── .github/
+│   ├── workflows/ci.yml         # Windows (MSYS2 UCRT64) + Linux build and ctest, clang-format check
+│   ├── workflows/release.yml    # on a v* tag: build, test, package, draft GitHub release
+│   └── release-notes/vX.Y.Z.md  # the body of each GitHub release
 ├── .clang-format
-├── .gitignore
+├── .gitignore                   # also ignores CLAUDE.md, kept as local AI working notes
 ├── .vscode/                     # CMake Tools settings
-├── CLAUDE.md                    # working notes for AI-assisted development
-├── CMakeLists.txt               # datum_core lib, datum CLI, datum_robustness, datum_tests
+├── CHANGELOG.md                 # Keep a Changelog, one section per release
+├── CMakeLists.txt               # project version; datum_core lib, datum, datum_robustness, datum_tests
 ├── LICENSE
 ├── README.md                    # user-facing guide
 ├── docs/
@@ -372,6 +377,7 @@ datum embed    -i <cover> -o <stego> -d <payload> [--mode M]
 datum extract  -i <stego> -o <payload> [--mode M]
 datum analyze  -i <carrier>
 datum help
+datum --version
 ```
 
 `--mode` defaults to `raw`. `--repeat` is video only. Output must be `.png` for images
@@ -812,3 +818,41 @@ into the phase that builds it.
   deep. [`RAW_BITS.md`](RAW_BITS.md) measured it surviving H.264 CRF 23 where
   per-channel `raw` cannot.
 - **A real upload test** against an unlisted video, run on the project's own content.
+
+## 12. Releases and versioning
+
+### Policy
+
+- **Semantic Versioning, below 1.0 for now.** A 0.x minor bump may change the CLI or
+  the carrier format. 1.0 waits until the DTM1 format has survived Phase 4b unchanged
+  for at least one release, because 1.0 promises that carriers stay readable.
+- **The version lives in one place:** `project(datum VERSION x.y.z)` in `CMakeLists.txt`.
+  It is compiled into `datum --version`, a CTest checks the output, and the release
+  workflow refuses a tag that disagrees with it.
+- **The DTM1 `version` byte is separate from the release version.** It changes only
+  when the header's meaning changes. Every release that changes it must say in
+  `CHANGELOG.md` whether older carriers still read.
+- **Binaries:** Windows x86-64 (MinGW-w64 UCRT64) and Linux x86-64, both fully static,
+  each archive holding the program, `README.md`, `CHANGELOG.md` and `LICENSE`, plus a
+  `SHA256SUMS.txt`. macOS and other platforms build from source. The binaries are not
+  code-signed.
+
+### Checklist
+
+1. `main` is green in CI, and the README examples still match real output.
+2. Bump `project(datum VERSION …)` in `CMakeLists.txt`.
+3. In `CHANGELOG.md`, move `[Unreleased]` entries under a new `[x.y.z] - YYYY-MM-DD`
+   heading and update the comparison links at the bottom.
+4. Write `.github/release-notes/vx.y.z.md`. The release workflow fails without it.
+5. Optional dry run: start the `release` workflow by hand from the Actions tab. It
+   builds, tests and uploads the archives as artifacts without creating a release.
+6. Commit, then tag and push: `git tag -a vx.y.z -m "datum x.y.z"` and
+   `git push origin vx.y.z`.
+7. The workflow creates a **draft** release with the archives and checksums. Review it
+   on GitHub and publish it.
+
+### History
+
+| Version | Date | Scope |
+|---|---|---|
+| 0.1.0 | 2026-09-16 | Phases 0–6: five modes, video, `analyze`, `datum_robustness`, prebuilt binaries |

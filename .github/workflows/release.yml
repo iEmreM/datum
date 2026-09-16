@@ -1,0 +1,105 @@
+name: release
+
+# Pushing a tag like v0.1.0 builds, tests and packages both platforms, then opens a
+# *draft* GitHub release with the archives and checksums attached. Publishing the
+# draft stays a manual step. Running this workflow by hand from the Actions tab does
+# everything except the release, and leaves the archives as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: package / windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-ffmpeg
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          version=$(build/datum.exe --version | tr -d '\r' | cut -d' ' -f2)
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the CMake project version $version"
+            exit 1
+          fi
+          name=datum-$version-windows-x86_64
+          mkdir -p "stage/$name" dist
+          cp build/datum.exe README.md CHANGELOG.md LICENSE "stage/$name/"
+          strip "stage/$name/datum.exe"
+          (cd stage && zip -r "../dist/$name.zip" "$name")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    name: package / linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # Fully static, so the binary also runs on distributions older than the runner.
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS=-static
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          version=$(build/datum --version | cut -d' ' -f2)
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the CMake project version $version"
+            exit 1
+          fi
+          name=datum-$version-linux-x86_64
+          mkdir -p "stage/$name" dist
+          cp build/datum README.md CHANGELOG.md LICENSE "stage/$name/"
+          strip "stage/$name/datum"
+          tar -C stage -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  release:
+    name: draft release
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum datum-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=".github/release-notes/$GITHUB_REF_NAME.md"
+          if [[ ! -f "$notes" ]]; then
+            echo "::error::missing $notes — write the release notes before tagging"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "datum $GITHUB_REF_NAME" --notes-file "$notes"

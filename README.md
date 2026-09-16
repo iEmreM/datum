@@ -114,7 +114,46 @@ The full measurements are in [What survives what](#what-survives-what).
 
 ## Getting started
 
-### Step 1: Install the requirements
+You can download a prebuilt binary (Option A) or build `datum` from source (Option B).
+
+### Option A: Download a release
+
+**Step 1: download.** Open the [Releases page](https://github.com/iEmreM/datum/releases)
+and download the archive for your platform:
+
+| Platform | File |
+|---|---|
+| Windows x86-64 | `datum-<version>-windows-x86_64.zip` |
+| Linux x86-64 | `datum-<version>-linux-x86_64.tar.gz` |
+
+Both binaries are statically linked and need no extra libraries. On other platforms,
+use Option B.
+
+**Step 2: extract it and check that it runs.**
+
+```sh
+tar -xzf datum-0.1.0-linux-x86_64.tar.gz
+./datum-0.1.0-linux-x86_64/datum --version
+# datum 0.1.0
+```
+
+On Windows, unzip the archive, open a terminal in the extracted folder and run
+`.\datum.exe --version`. The executable is not code-signed, so SmartScreen may warn the
+first time you run it.
+
+**Step 3 (video only): install ffmpeg.** It is not bundled. Images work without it.
+
+```sh
+sudo apt install ffmpeg          # Debian/Ubuntu
+winget install Gyan.FFmpeg       # Windows
+```
+
+To verify a download, compare it against the `SHA256SUMS.txt` file attached to the
+release, for example with `sha256sum -c SHA256SUMS.txt --ignore-missing`.
+
+### Option B: Build from source
+
+#### Step 1: Install the requirements
 
 | Requirement | Needed for | Notes |
 |---|---|---|
@@ -138,7 +177,7 @@ pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
 
 Other platforms with a C++20 compiler should work, but CI does not cover them.
 
-### Step 2: Build
+#### Step 2: Build
 
 ```sh
 git clone https://github.com/iEmreM/datum.git
@@ -160,17 +199,17 @@ The build produces three programs in `build/`:
 On Windows the MinGW build is statically linked, so `build\datum.exe` runs on its own
 without any DLLs next to it.
 
-### Step 3: Run the tests
+#### Step 3: Run the tests
 
 ```sh
 ctest --test-dir build --output-on-failure
 ```
 
-Both tests should pass. If the video tests fail with `no video stream in …`, see
+All tests should pass. If the video tests fail with `no video stream in …`, see
 [Troubleshooting](#troubleshooting).
 
-> The examples below call `datum`. Either add `build/` to your `PATH` or type
-> `build/datum` (`build\datum.exe` on Windows).
+> The examples below call `datum`. Either add its folder (the extracted release, or
+> `build/`) to your `PATH`, or type the full path to the program.
 
 ## Quick start: hide a file in three steps
 
@@ -406,6 +445,7 @@ datum embed    -i <cover> -o <stego> -d <payload> [--mode M] [--bits N | --delta
 datum extract  -i <stego> -o <payload> [--mode M]
 datum analyze  -i <carrier>
 datum help
+datum --version
 ```
 
 | Command | What it does |
@@ -415,6 +455,7 @@ datum help
 | `embed` | Hides `-d <payload>` in `-i <cover>` and writes `-o <stego>`, reporting PSNR. |
 | `extract` | Recovers the payload and verifies its CRC. The mode is detected unless `--mode` is given. |
 | `analyze` | Runs chi-square and RS steganalysis (on the first frame of a video). |
+| `help`, `--version` | Prints the usage summary, or the version number. |
 
 | Flag | Mode | Range | Default | Meaning |
 |---|---|---|---|---|
@@ -542,7 +583,8 @@ docs/                   roadmap, design decisions and measurements
 | 7 | Performance: profiling, parallel frames | ☐ |
 
 The design decisions behind each phase, the open questions and the backlog are in
-[`docs/ROADMAP.md`](docs/ROADMAP.md).
+[`docs/ROADMAP.md`](docs/ROADMAP.md). Released versions and their changes are listed in
+[`CHANGELOG.md`](CHANGELOG.md); version 0.1.0 covers Phases 0–6.
 
 ## Contributing
 
@@ -559,8 +601,6 @@ comments and docs are in English.
    results in `docs/`.
 5. Do not add dependencies lightly. [`docs/ROADMAP.md` §4](docs/ROADMAP.md#4-dependencies--deliberately-minimal)
    explains what is used and why.
-
-[`CLAUDE.md`](CLAUDE.md) holds the working notes used for AI-assisted development.
 
 ## License
 
