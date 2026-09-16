@@ -6,15 +6,21 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)
 
-Most "hide a file in a picture" tools glue the file onto the end of the image, where any
-byte scan finds it. `datum` writes the data **into the pixel values themselves**. It
-ships five embedding modes. One is invisible to the eye, and one survives a JPEG
-re-save, an H.264 or VP9 re-encode and a resize. Every extraction is checked with a
-CRC, so you get your exact file back or a clear error, never a silently corrupted file.
+`datum` is a command-line tool that writes any file (a document, an archive, another
+image) directly into the pixel values of a photo or a video. It does not append the
+file to the end.
+
+- **Images and video:** hide a file in a photo, or spread it across a video's frames.
+- **Exact recovery:** `extract` detects the mode on its own and verifies the file with a
+  CRC-32.
+- **Five modes:** from invisible to the eye (`lsb`) to surviving JPEG, H.264/VP9 and
+  resizing (`dct`).
+- **Built-in steganalysis:** `datum analyze` shows how detectable a hidden file is.
 
 ```sh
-datum embed   -i photo.png -o stego.png -d secret.zip --mode lsb
-datum extract -i stego.png -o secret.zip        # the mode is detected automatically
+datum embed   -i photo.png -o stego.png -d secret.zip --mode lsb   # image → PNG
+datum embed   -i clip.mp4  -o stego.mkv -d secret.zip --mode lsb   # video → MKV
+datum extract -i stego.png -o secret.zip                           # mode detected automatically
 ```
 
 ---
@@ -45,12 +51,10 @@ datum extract -i stego.png -o secret.zip        # the mode is detected automatic
 
 ## Features
 
-- **Data in the pixels, not after them.** Nothing is appended to the file, and the
-  output is a normal PNG or MKV that opens in any viewer.
-- **Five modes, five trade-offs.** Each mode balances capacity, visibility and
-  robustness differently.
-- **Images and video.** The same commands work on both. A video payload can span many
-  frames, or be copied into several frames for redundancy.
+- **Ordinary output files.** Nothing is appended to the file, and the result is a
+  normal PNG or MKV that opens in any viewer or player.
+- **Same commands for images and video.** A video payload can span many frames, or be
+  copied into several frames so it survives a dropped frame (`--repeat`).
 - **Self-describing.** A small header stores the mode, its strength setting, the
   payload length and a CRC-32. `extract` needs nothing but the file.
 - **Fails loudly.** An oversized payload, a lossy output format, a mistyped flag or a
