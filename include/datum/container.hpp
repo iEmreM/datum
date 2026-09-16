@@ -37,8 +37,8 @@ inline constexpr std::size_t kHeaderSize = 16;
 inline constexpr uint8_t kFlagEcc = 0x04;
 
 /// Video temporal repetition lives in the five flag bits nothing else uses: the
-/// whole stream is written N times over, one copy per group of frames, and the
-/// copies are majority-voted back together at extraction.
+/// whole stream is written into each of the first N frames, one complete copy per
+/// frame, and the copies are majority-voted back together at extraction.
 ///
 /// It goes here rather than in a new header field because the field would cost a
 /// format version bump for five bits, and 32 copies is already far past the point

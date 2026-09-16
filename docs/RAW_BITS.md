@@ -88,8 +88,8 @@ depth, and is not implemented. `binary` mode already occupies that corner at `N 
 (black/white instead of 64/192, so an even wider margin); the measurements above say a
 2- or 3-bit version of it is the interesting thing to build next.
 
-Reproduce with the harness under `scratchpad/robust.cpp` in the session that produced
-this, or by hand:
+The tables above came from a one-off harness that was not kept in the repository —
+`datum_robustness` sweeps only `qim` and `dct`. The JPEG result reproduces by hand:
 
 ```sh
 datum embed -i cover.png -o stego.png -d secret.zip --mode raw --bits 2

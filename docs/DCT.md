@@ -242,8 +242,8 @@ video, spanning frames              = 3490 x frames         (fragile: no redunda
 video, --repeat N                   = 3490 bytes, whatever the length
 ```
 
-A 90-frame 1080p clip holds 318 KB spanning, or 3.4 KB repeated. The roadmap expected
-0.1–1 KB per second of video and this is the same order — the difference is that
+A 90-frame 1080p clip holds 318 KB spanning, or 3.4 KB repeated. The roadmap's original
+estimate was 0.1–1 KB per second of video and this is the same order — the difference is that
 `--repeat` spends frames on redundancy rather than on more payload, which is the trade
 the mode is for.
 
